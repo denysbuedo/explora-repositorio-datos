@@ -51,8 +51,10 @@ if (signedInUser && auth.token() && ['collections.html','self-assessment.html'].
   document.querySelector('.public-nav')?.remove();
 }
 document.querySelectorAll('.brand').forEach(brand => {
-  const logo = document.createElement('img'); logo.src = 'logo%20mes.png'; uiI18n.attribute(logo,'alt','brand.alt');
-  const name = document.createElement('span'); name.textContent = 'EXPLORA'; brand.replaceChildren(logo,name);
+  const logo = document.createElement('img');
+  logo.src = 'brand/explora-logo-principal.svg';
+  logo.alt = 'EXPLORA · Repositorio de datos científicos';
+  brand.replaceChildren(logo);
 });
 const editorial = ['CURATOR','ADMINISTRATOR'].includes(signedInUser?.role);
 const administrator = signedInUser?.role === 'ADMINISTRATOR';
