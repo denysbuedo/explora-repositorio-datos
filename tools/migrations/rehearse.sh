@@ -3,7 +3,7 @@ set -euo pipefail
 
 # Never connects to a live database. All SQL runs in a throwaway local cluster.
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
-MIGRATION="$ROOT/docs/migrations/2026-09-scientific-records.sql"
+MIGRATION="$ROOT/src/main/resources/db/migration/postgresql/V1__scientific_repository_extension.sql"
 SOURCE_DUMP=""
 SOURCE_FILES=""
 DIAGNOSTICS=""

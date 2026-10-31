@@ -20,6 +20,6 @@ Los perfiles son opcionales en este bloque: no se inventa un perfil instituciona
 
 ## Persistencia y despliegue
 
-Las tablas de perfiles/reglas y las copias por dataset forman parte del backup PostgreSQL. Migración idempotente en `docs/migrations/2026-09-scientific-records.sql`, sin ejecutar contra producción. No hay FK desde el identificador congelado a la definición viva: la copia debe sobrevivir a cambios administrativos del registro.
+Las tablas de perfiles/reglas y las copias por dataset forman parte del backup PostgreSQL. Migración Flyway idempotente en `src/main/resources/db/migration/postgresql/V1__scientific_repository_extension.sql`, sin ejecutar contra producción. No hay FK desde el identificador congelado a la definición viva: la copia debe sobrevivir a cambios administrativos del registro.
 
 Este documento describe el alcance implementado; la evidencia de pruebas se registra en `REDUNIV_EXECUTION_PLAN.md` al completar la validación.

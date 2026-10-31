@@ -41,7 +41,7 @@ public class PublicDatasetArchiveControllerTest {
         try {
             Files.writeString(markdown, "# Proyecto"); Files.writeString(data, "a,b\n1,2\n");
             var resource = published("OPEN", null);
-            var description = file("description.md", markdown);
+            var description = file("description/description.md", markdown);
             var dataset = file("table.csv", data);
             when(contents.findByParentResource(eq(resource), any(Pageable.class)))
                     .thenReturn(new PageImpl<>(List.of(description, dataset)));
@@ -53,7 +53,7 @@ public class PublicDatasetArchiveControllerTest {
                 java.util.zip.ZipEntry entry;
                 while ((entry = zip.getNextEntry()) != null) entries.put(entry.getName(), new String(zip.readAllBytes()));
             }
-            assertEquals("# Proyecto", entries.get("description.md"));
+            assertEquals("# Proyecto", entries.get("description/description.md"));
             assertEquals("a,b\n1,2\n", entries.get("table.csv"));
             assertEquals(2, entries.size());
             assertFalse(entries.containsKey("preservation/provenance.json"));
@@ -89,6 +89,17 @@ public class PublicDatasetArchiveControllerTest {
     @Test public void unsafeFileNameFailsBeforeAnyZipBytesAreSent() throws Exception {
         var resource = published("OPEN", null);
         var invalid = new ContentInformation(); invalid.setRelativePath("../secrets.txt");
+        when(contents.findByParentResource(eq(resource), any(Pageable.class)))
+                .thenReturn(new PageImpl<>(List.of(invalid)));
+        var response = new MockHttpServletResponse();
+        assertEquals(HttpStatus.CONFLICT, assertThrows(ResponseStatusException.class,
+                () -> controller.download("r1", response)).getStatusCode());
+        assertEquals(0, response.getContentAsByteArray().length);
+    }
+
+    @Test public void windowsAbsoluteFileNameFailsBeforeAnyZipBytesAreSent() throws Exception {
+        var resource = published("OPEN", null);
+        var invalid = new ContentInformation(); invalid.setRelativePath("C:/secrets.txt");
         when(contents.findByParentResource(eq(resource), any(Pageable.class)))
                 .thenReturn(new PageImpl<>(List.of(invalid)));
         var response = new MockHttpServletResponse();

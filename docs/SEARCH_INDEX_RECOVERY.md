@@ -28,7 +28,7 @@ SELECT count(*) AS pendientes, min(created_at) AS primera_pendiente FROM search_
 SELECT resource_id, count(*) FROM search_index_tasks GROUP BY resource_id ORDER BY count(*) DESC;
 ```
 
-Aplique la migración idempotente de `docs/migrations/2026-09-scientific-records.sql` si el
+Aplique la migración Flyway de `src/main/resources/db/migration/postgresql/V1__scientific_repository_extension.sql` si el
 servidor utiliza `ddl-auto=validate`. No vacíe la cola para corregir una caída de Elasticsearch.
 La cola empieza a cubrir las modificaciones desde esta actualización; no representa por sí
 sola una reconstrucción inicial de un índice histórico incompleto.

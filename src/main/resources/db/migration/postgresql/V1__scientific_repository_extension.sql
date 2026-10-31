@@ -1,6 +1,5 @@
 -- Review and back up PostgreSQL before running this migration.
 -- Execute in a maintenance window; do not run concurrently with application writes.
-BEGIN;
 
 CREATE TABLE IF NOT EXISTS scientific_records (
     resource_id varchar(255) PRIMARY KEY,
@@ -250,7 +249,6 @@ CREATE TABLE IF NOT EXISTS scientific_privacy_assessments (
     review_note varchar(1000)
 );
 
-COMMIT;
 
 -- Author-declared scientific provenance; separate from machine-observed file events.
 ALTER TABLE scientific_records ADD COLUMN IF NOT EXISTS production_description VARCHAR(5000);

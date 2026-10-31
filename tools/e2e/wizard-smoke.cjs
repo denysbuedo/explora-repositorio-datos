@@ -1223,7 +1223,7 @@ async function restorePostgresFixture(page, base, files, published, profiledDraf
     return result;
   }
   const baseline = tree(files.data);
-  const migration = path.join(root,'docs/migrations/2026-09-scientific-records.sql');
+  const migration = path.join(root,'src/main/resources/db/migration/postgresql/V1__scientific_repository_extension.sql');
   for (let i=0;i<2;i++) pg('psql',['-X','-v','ON_ERROR_STOP=1','-d',postgres.database,'-f',migration]);
   function dataFingerprints(database) {
     const tables = pg('psql',['-X','-At','-d',database,'-c',

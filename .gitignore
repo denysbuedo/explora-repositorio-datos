@@ -8,6 +8,8 @@
 /bin/
 **/application.properties
 **/.DS_Store
+**/__pycache__/
+*.py[cod]
 
 /data/
 

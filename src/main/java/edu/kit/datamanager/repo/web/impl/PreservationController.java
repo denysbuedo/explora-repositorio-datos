@@ -183,10 +183,14 @@ public class PreservationController {
 
     private static boolean safeRelativePath(String relative) {
         if (relative == null || relative.isBlank() || relative.startsWith("/") || relative.contains("\\") ||
-                relative.indexOf('\n') >= 0 || relative.indexOf('\r') >= 0 || relative.startsWith("preservation/")) return false;
+                relative.endsWith("/") || relative.indexOf('\n') >= 0 || relative.indexOf('\r') >= 0 ||
+                relative.startsWith("preservation/")) return false;
         try {
-            Path normalized = Path.of(relative).normalize();
-            return !".".equals(relative) && !normalized.startsWith("..") && normalized.toString().equals(relative);
+            if (Path.of(relative).isAbsolute() || relative.matches("^[A-Za-z]:/.*")) return false;
+            for (String segment : relative.split("/", -1)) {
+                if (segment.isEmpty() || ".".equals(segment) || "..".equals(segment)) return false;
+            }
+            return true;
         } catch (InvalidPathException error) { return false; }
     }
 }

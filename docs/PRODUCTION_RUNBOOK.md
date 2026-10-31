@@ -11,10 +11,22 @@ La demo local y sus datos no son configuración de producción.
    consistente de `/var/lib/base-repo/data` y configuración externa.
 3. Probar restauración aislada según `tools/releases/README.md`. No ejecutar
    DROP ni recrear PostgreSQL para actualizar.
-4. Revisar `docs/migrations/2026-09-scientific-records.sql` contra el esquema real;
+4. Revisar `src/main/resources/db/migration/postgresql/V1__scientific_repository_extension.sql` contra el esquema real;
    aplicar migraciones aprobadas y usar `spring.jpa.hibernate.ddl-auto=validate`.
-   `update.sh` bloquea otros modos. Para primera instalación, `deploy.sh` admite
-   `update` con advertencia: preparar esquema antes de abrir el acceso público.
+   `update.sh` bloquea otros modos. Flyway no crea el esquema heredado completo:
+   una instalación vacía necesita un baseline institucional aprobado.
+
+### Adopción inicial de Flyway en una base existente
+
+1. Detener escrituras y obtener/restaurar una copia coherente de base y archivos.
+2. Ejecutar `tools/migrations/rehearse.sh` contra esa copia y resolver diferencias.
+3. Con la herramienta Flyway institucional, crear explícitamente el baseline `0`
+   sobre la copia no vacía y ejecutar `migrate`; no usar baseline automático.
+4. Verificar `flyway_schema_history`: baseline `0` y migración `1` satisfactoria.
+5. Arrancar el candidato con `ddl-auto=validate`, ejecutar pruebas funcionales y
+   restaurar desde backup si falla. No usar `repair` para ocultar un checksum distinto.
+6. Repetir el procedimiento aprobado en mantenimiento y conservar siempre
+   `baseline-on-migrate=false`, `clean-disabled=true` y `out-of-order=false`.
 
 ## 2. Configuración externa de la VM
 

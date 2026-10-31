@@ -52,6 +52,6 @@ solicitud de certificación siguen siendo responsabilidades institucionales.
 
 ## Migración
 
-`docs/migrations/2026-09-scientific-records.sql` añade las tablas de observaciones y
+`src/main/resources/db/migration/postgresql/V1__scientific_repository_extension.sql` añade las tablas de observaciones y
 autoevaluación de forma idempotente, sin borrar ni recrear datasets/usuarios.
 Aplicar con el procedimiento habitual de actualización y copia de seguridad.

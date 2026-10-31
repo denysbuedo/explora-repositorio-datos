@@ -132,7 +132,7 @@ rama con `main` sin aprobación explícita y pruebas funcionales.
 ### Migración y pruebas
 
 Antes de desplegar esta rama: respaldar PostgreSQL y archivos, revisar
-`docs/migrations/2026-09-scientific-records.sql`, aplicarlo en mantenimiento y
+`src/main/resources/db/migration/postgresql/V1__scientific_repository_extension.sql`, aplicarlo en mantenimiento y
 probar restauración. `tools/migrations/rehearse.sh` ensaya localmente
 idempotencia, dump/restauración y archivos en PostgreSQL efímero; pasó con
 fixture y snapshot de prueba, pero no sustituye una copia real de staging ni

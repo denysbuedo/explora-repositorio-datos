@@ -31,6 +31,10 @@ def inspect(filename, strict_schema=False):
     require(schema not in ('create','create-drop'),'Destructive Hibernate schema mode is forbidden')
     if schema!='validate':
         (errors if strict_schema else warnings).append('Apply reviewed migrations and set spring.jpa.hibernate.ddl-auto=validate')
+    require(true('spring.flyway.enabled'),'Enable Flyway for production schema management')
+    require(values.get('spring.flyway.clean-disabled','').lower()=='true','Disable Flyway clean in production')
+    require(values.get('spring.flyway.baseline-on-migrate','').lower()=='false','Disable automatic Flyway baseline after the controlled adoption step')
+    require(values.get('spring.flyway.baseline-version')=='0','Use the reviewed Flyway baseline version 0')
     require(values.get('repo.basepath','').startswith('file:/') and values.get('repo.basepath')!='file:/','Set repo.basepath to an absolute persistent local directory')
     domain=values.get('repo.public-domain','')
     require(bool(domain) and domain not in ('localhost','127.0.0.1') and '/' not in domain,'Set the real repo.public-domain')
@@ -45,7 +49,7 @@ def inspect(filename, strict_schema=False):
     require(values.get('spring.mail.properties.mail.smtp.ssl.trust')!='*','Do not trust all SMTP certificates')
     require(true('repo.privacy.require-assessment'),'Enable required privacy assessment')
     if not true('repo.search.enabled'):warnings.append('Elasticsearch disabled; explicitly approve degraded search before release')
-    warnings.append('Not verified here: DNS/TLS/HAProxy rules, SMTP delivery, DOI credentials, backup restoration and migration compatibility')
+    warnings.append('Not verified here: DNS/TLS/HAProxy rules, SMTP delivery, DOI credentials, backup restoration and Flyway migration compatibility')
     return {'ready':not errors,'errors':errors,'warnings':warnings}
 
 def main():

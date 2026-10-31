@@ -88,10 +88,13 @@ public class PublicDatasetArchiveController {
 
     static boolean safeRelativePath(String name) {
         if (name == null || name.isBlank() || name.startsWith("/") || name.contains("\\") ||
-                name.indexOf('\r') >= 0 || name.indexOf('\n') >= 0) return false;
+                name.endsWith("/") || name.indexOf('\r') >= 0 || name.indexOf('\n') >= 0) return false;
         try {
-            Path normalized = Path.of(name).normalize();
-            return !normalized.startsWith("..") && normalized.toString().equals(name) && !".".equals(name);
+            if (Path.of(name).isAbsolute() || name.matches("^[A-Za-z]:/.*")) return false;
+            for (String segment : name.split("/", -1)) {
+                if (segment.isEmpty() || ".".equals(segment) || "..".equals(segment)) return false;
+            }
+            return true;
         } catch (InvalidPathException failure) { return false; }
     }
 

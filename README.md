@@ -130,7 +130,7 @@ Las actualizaciones requieren la revisión actual para detectar conflictos.
 
 Antes de actualizar una instalación con validación de esquema, hacer copia de
 seguridad y aplicar en mantenimiento la migración revisada
-`docs/migrations/2026-09-scientific-records.sql`, que incluye las dos tablas de
+`src/main/resources/db/migration/postgresql/V1__scientific_repository_extension.sql`, que incluye las dos tablas de
 colecciones. No ejecutar migraciones sobre producción sin autorización.
 
 ### Inventario y metadatos públicos

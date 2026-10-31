@@ -11,7 +11,7 @@ Rama exclusiva: `develop-reduniv`. Sin merge, push ni cambios de producción.
 
 ## Operación y límites explícitos
 
-- Migración idempotente: `docs/migrations/2026-09-scientific-records.sql`; añade cola y
+- Migración Flyway idempotente: `src/main/resources/db/migration/postgresql/V1__scientific_repository_extension.sql`; añade cola y
   claims, no elimina ni recrea datos. Aplicar antes de arrancar si usa ddl-auto=validate.
 - ES caído: no se pierde la escritura SQL; ver `SEARCH_INDEX_RECOVERY.md`.
 - Caída abrupta durante DOI: ejecución queda bloqueada por seguridad; recuperar

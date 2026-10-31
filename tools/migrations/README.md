@@ -1,7 +1,7 @@
 # Ensayo aislado de migración RedUniv
 
 `rehearse.sh` arranca un clúster PostgreSQL temporal **solo por socket Unix**,
-aplica `docs/migrations/2026-09-scientific-records.sql` dos veces, compara el
+aplica `src/main/resources/db/migration/postgresql/V1__scientific_repository_extension.sql` dos veces, compara el
 esquema, hace `pg_dump`/`pg_restore` y compara esquema, datos y archivos tras
 restaurar. El clúster y las copias temporales se eliminan al salir. Ejecútelo
 **sin sudo**; nunca conecta al servidor de origen.

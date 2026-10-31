@@ -10,6 +10,6 @@ Cada lista tiene una propuesta pendiente separada de la última lista aprobada. 
 - Máximo 100 caracteres por licencia y 255 por disciplina; controles/vacíos rechazados.
 - Revisión obligatoria en cambios de registros existentes y aprobación; un cliente obsoleto recibe conflicto y debe recargar, no sobrescribir.
 - La lista aprobada permanece en PostgreSQL y entra en el backup/restauración ordinarios.
-- Migración idempotente: `docs/migrations/2026-09-scientific-records.sql`; no ejecutada contra producción.
+- Migración Flyway idempotente: `src/main/resources/db/migration/postgresql/V1__scientific_repository_extension.sql`; no ejecutada contra producción.
 
 No elimina las políticas institucionales de revisión de licencias, identificadores o perfiles de metadatos. Los perfiles son un módulo independiente implementado en `METADATA_PROFILES.md`; su definición y aprobación institucional no se sustituyen por estas listas.

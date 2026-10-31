@@ -68,7 +68,7 @@ boolean_value(){
 }
 remove_managed_properties(){
   local tmp keys
-  keys='management.endpoints.web.exposure.include,repo.security.allowedOriginPattern,server.port,server.address,server.forward-headers-strategy,server.tomcat.remoteip.remote-ip-header,server.tomcat.remoteip.protocol-header,spring.datasource.driver-class-name,spring.datasource.url,spring.datasource.username,spring.datasource.password,spring.jpa.database,spring.jpa.database-platform,repo.basepath,repo.search.url,repo.search.enabled,repo.mail.description,spring.mail.host,spring.mail.port,spring.mail.username,spring.mail.password,spring.mail.properties.mail.smtp.auth,spring.mail.properties.mail.smtp.starttls.enable,spring.mail.properties.mail.smtp.starttls.required,spring.mail.properties.mail.smtp.ssl.trust,spring.mail.properties.mail.smtp.ssl.checkserveridentity,spring.mail.properties.mail.smtp.connectiontimeout,spring.mail.properties.mail.smtp.timeout,spring.mail.properties.mail.smtp.writetimeout,repo.mail.from,repo.fixity.enabled,repo.fixity.alert-to,repo.metrics.datacite.enabled,repo.metrics.datacite.repository-id,repo.privacy.require-assessment,repo.allowed-origin-pattern,repo.public-domain,repo.deploy.db-name,repo.deploy.haproxy-network,repo.deploy.private-host,repo.deploy.haproxy-port,repo.auth.enabled,repo.auth.jwtSecret,repo.auth.bootstrap-admin-password,repo.datacite.enabled,repo.datacite.api-url,repo.datacite.repository-id,repo.datacite.password,repo.datacite.prefix,repo.datacite.public-base-url,repo.scientific.orcid.enabled,repo.scientific.orcid.environment,repo.scientific.orcid.client-id,repo.scientific.orcid.client-secret,repo.scientific.orcid.redirect-uri'
+  keys='management.endpoints.web.exposure.include,repo.security.allowedOriginPattern,server.port,server.address,server.forward-headers-strategy,server.tomcat.remoteip.remote-ip-header,server.tomcat.remoteip.protocol-header,spring.datasource.driver-class-name,spring.datasource.url,spring.datasource.username,spring.datasource.password,spring.jpa.database,spring.jpa.database-platform,spring.jpa.hibernate.ddl-auto,spring.flyway.enabled,spring.flyway.locations,spring.flyway.validate-on-migrate,spring.flyway.clean-disabled,spring.flyway.out-of-order,spring.flyway.baseline-on-migrate,spring.flyway.baseline-version,repo.basepath,repo.search.url,repo.search.enabled,repo.mail.description,spring.mail.host,spring.mail.port,spring.mail.username,spring.mail.password,spring.mail.properties.mail.smtp.auth,spring.mail.properties.mail.smtp.starttls.enable,spring.mail.properties.mail.smtp.starttls.required,spring.mail.properties.mail.smtp.ssl.trust,spring.mail.properties.mail.smtp.ssl.checkserveridentity,spring.mail.properties.mail.smtp.connectiontimeout,spring.mail.properties.mail.smtp.timeout,spring.mail.properties.mail.smtp.writetimeout,repo.mail.from,repo.fixity.enabled,repo.fixity.alert-to,repo.metrics.datacite.enabled,repo.metrics.datacite.repository-id,repo.privacy.require-assessment,repo.allowed-origin-pattern,repo.public-domain,repo.deploy.db-name,repo.deploy.haproxy-network,repo.deploy.private-host,repo.deploy.haproxy-port,repo.auth.enabled,repo.auth.jwtSecret,repo.auth.bootstrap-admin-password,repo.datacite.enabled,repo.datacite.api-url,repo.datacite.repository-id,repo.datacite.password,repo.datacite.prefix,repo.datacite.public-base-url,repo.scientific.orcid.enabled,repo.scientific.orcid.environment,repo.scientific.orcid.client-id,repo.scientific.orcid.client-secret,repo.scientific.orcid.redirect-uri'
   tmp="$(mktemp "$CONF.XXXXXX")"
   awk -v keys="$keys" '
     BEGIN { count=split(keys, items, ","); for (i=1; i<=count; i++) managed[items[i]]=1 }
@@ -342,6 +342,14 @@ spring.datasource.username: $DB_USER
 spring.datasource.password: $DB_PASSWORD
 spring.jpa.database: POSTGRESQL
 spring.jpa.database-platform: org.hibernate.dialect.PostgreSQLDialect
+spring.jpa.hibernate.ddl-auto: validate
+spring.flyway.enabled: true
+spring.flyway.locations: classpath:db/migration/postgresql
+spring.flyway.validate-on-migrate: true
+spring.flyway.clean-disabled: true
+spring.flyway.out-of-order: false
+spring.flyway.baseline-on-migrate: false
+spring.flyway.baseline-version: 0
 # Directorio persistente y escribible para los archivos de los repositorios.
 repo.basepath: file:$REPO_DATA_DIR/
 repo.search.url: $ES_URL
