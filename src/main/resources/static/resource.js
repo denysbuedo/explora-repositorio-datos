@@ -1,0 +1,176 @@
+const $ = (selector) => document.querySelector(selector); auth.requireLogin();
+
+function resourceNode(tag, value='', className){const node=document.createElement(tag);node.textContent=value;if(className)node.className=className;return node;}
+function resourceLabel(tag,key,params={},className){const node=resourceNode(tag,'',className);uiI18n.set(node,key,params);return node;}
+function messageKey(key,kind='',params={}){const node=$('#resource-message');node.className='message';if(kind)uiI18n.plain(node,'');else uiI18n.set(node,key,params);if(kind==='success')toast.successKey(key,params);if(kind==='error')toast.errorKey(key,params);}
+
+const translationEditor=metadataTranslations.mount($('#metadata-translations'),$('#scientific-form').elements.namedItem('translations'));
+const resourceId = new URLSearchParams(location.search).get('id'); let resource, scientific, content=[], fileForDeletion, isOwner=false, doiEnabled=false; const user=auth.user();
+const reserveDoiButton=document.createElement('button');reserveDoiButton.id='reserve-doi';reserveDoiButton.type='button';reserveDoiButton.className='secondary';uiI18n.set(reserveDoiButton,'resourceDynamic.reserve');reserveDoiButton.hidden=true;document.querySelector('.science-actions').prepend(reserveDoiButton);
+const doiStatus=document.createElement('p');doiStatus.id='doi-sync-status';document.querySelector('#resource-doi').after(doiStatus);
+const doiEvidence=document.createElement('dl');doiEvidence.className='metadata-list';doiEvidence.id='doi-local-evidence';doiStatus.after(doiEvidence);let latestDoiStatus;
+function renderDoiEvidence(){doiEvidence.replaceChildren();const value=latestDoiStatus?.versionRegistration;if(!value)return;for(const [field,key]of [['registeredAt','doiEvidence.registered'],['publishedAt','doiEvidence.published'],['lastSyncedAt','doiEvidence.synced'],['lastAttemptAt','doiEvidence.attempt'],['landingPageUrl','doiEvidence.landing'],['metadataVersion','doiEvidence.revision']]){const label=document.createElement('dt'),item=document.createElement('dd');uiI18n.set(label,key);if(value[field]==null)uiI18n.set(item,'doiEvidence.unknown');else item.textContent=field.endsWith('At')?new Intl.DateTimeFormat(uiI18n.locale,{dateStyle:'medium',timeStyle:'short'}).format(new Date(value[field])):String(value[field]);doiEvidence.append(label,item);}}
+window.addEventListener('ui-locale-changed',renderDoiEvidence);
+$('#current-user').textContent=user?.username||''; if(user?.role==='ADMINISTRATOR')$('#users-nav').hidden=false; document.querySelectorAll('[data-logout]').forEach(b=>b.addEventListener('click',auth.logout)); document.querySelectorAll('[data-open-modal]').forEach(b=>b.addEventListener('click',()=>{if(b.dataset.openModal==='edit-modal')fillEditForm();document.querySelector(`#${b.dataset.openModal}`).showModal()})); document.querySelectorAll('[data-close-modal]').forEach(b=>b.addEventListener('click',()=>b.closest('dialog').close()));
+const archiveButton=document.createElement('button');archiveButton.className='secondary';uiI18n.set(archiveButton,'resourceDynamic.downloadDataset');document.querySelector('.resource-page-header .button-row').prepend(archiveButton);archiveButton.addEventListener('click',async()=>{try{await transfers.download(`/api/v1/dataresources/${encodeURIComponent(resourceId)}/archive`,`dataset-${resourceId}.zip`,uiI18n.t('resourceDynamic.datasetName'));toast.successKey('resourceDynamic.datasetReady')}catch(error){toast.errorObject(error)}});
+const escapeHtml=v=>String(v??'').replace(/[&<>'"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;',"'":'&#39;','"':'&quot;'}[c]));
+async function api(path, options={}){const r=await fetch(path,{...options,headers:auth.headers(options.headers)}), text=await r.text();let b;try{b=text?JSON.parse(text):null}catch{b=text}if(!r.ok){const detail=b?.message||b?.detail||b?.error;throw detail?new Error(detail):uiI18n.error('resourceDynamic.failure')}return b}
+function messageFailure(error){const node=$('#resource-message');node.className='message';uiI18n.plain(node,'');toast.errorObject(error);}
+function message(text,kind=''){const node=$('#resource-message');node.className='message';uiI18n.plain(node,kind?'':text);if(kind==='success')toast.success(text);if(kind==='error')toast.error(text)}
+const markdownItem=()=>content.find(x=>x.relativePath==='description.md'); const contentPath=item=>`/api/v1/dataresources/${encodeURIComponent(resourceId)}/data/${item.relativePath.split('/').map(encodeURIComponent).join('/')}`;
+function imageUrl(path){if(/^(https?:|data:)/i.test(path))return '';return `/api/v1/dataresources/${encodeURIComponent(resourceId)}/data/${path.split('/').map(encodeURIComponent).join('/')}`}
+function renderMarkdown(source){let safe=escapeHtml(source);safe=safe.replace(/!\[([^\]]*)\]\(([^\s)]+)(?:\s+&quot;[^)]*&quot;)?\)/g,(_,alt,path)=>{const url=imageUrl(path);return url?`<img src="${url}" alt="${alt}" loading="lazy">`:alt}); return safe.split(/\n\n+/).map(b=>{if(/^###\s/.test(b))return `<h3>${b.replace(/^###\s+/,'')}</h3>`;if(/^##\s/.test(b))return `<h2>${b.replace(/^##\s+/,'')}</h2>`;if(/^#\s/.test(b))return `<h1>${b.replace(/^#\s+/,'')}</h1>`;if(/^(?:[-*]\s.+\n?)+$/.test(b))return `<ul>${b.split('\n').filter(Boolean).map(x=>`<li>${x.replace(/^[-*]\s+/,'')}</li>`).join('')}</ul>`;return `<p>${b.replace(/\*\*(.+?)\*\*/g,'<strong>$1</strong>').replace(/`(.+?)`/g,'<code>$1</code>').replace(/\n/g,'<br>')}</p>`}).join('')}
+async function hydrateMarkdownImages(){for(const image of document.querySelectorAll('#markdown-rendered img')){try{const response=await fetch(image.src,{headers:auth.headers()});if(!response.ok)throw Error();const url=URL.createObjectURL(await response.blob());image.loading='eager';image.src=url;await image.decode().catch(()=>{});}catch{image.replaceWith(resourceLabel('span','resourceDynamic.imageFailure'))}}}
+function renderFiles(){
+ const list=$('#download-list');list.replaceChildren();const files=content.filter(x=>x!==markdownItem());
+ if(!files.length)list.append(resourceLabel('p','resourceDynamic.emptyFiles',{},'empty'));
+ for(const file of files){
+  const row=resourceNode('div','','file-row'),info=resourceNode('span'),name=resourceNode('strong',file.relativePath);name.title=file.relativePath;info.append(name);
+  const media=resourceNode('small');media.append(resourceNode('span',`${file.size??0} bytes · `),file.mediaType?resourceNode('span',file.mediaType):resourceLabel('span','resourceDynamic.file'));info.append(media);
+  if(file.metadata?.sha256){const checksum=resourceNode('small',`SHA-256: ${file.metadata.sha256}`);uiI18n.attribute(checksum,'aria-label','resourceDynamic.checksumHint');info.append(checksum);}
+  const actions=resourceNode('span','','row-actions');
+  const get=resourceLabel('button','publicRecord.download',{},'secondary download-file');get.dataset.path=file.relativePath;get.onclick=download;
+  const remove=resourceLabel('button','resourceStatic.deleteFile',{},'danger-outline delete-file');remove.dataset.path=file.relativePath;remove.onclick=()=>openFileDelete(file.relativePath);actions.append(get,remove);row.append(info,actions);list.append(row);
+ }
+}
+function renderMetadata(){
+ const creator=resource.creators?.map(x=>[x.givenName,x.familyName].filter(Boolean).join(' ')).join(', ')||'—';
+ const rows=[['production',scientific?.productionDescription],['processing',scientific?.processingDescription],['tools',scientific?.processingTools],['summary',scientific?.summary],['geographic',scientific?.geographicCoverage],['start',scientific?.temporalStart],['end',scientific?.temporalEnd],['title',resource.titles?.[0]?.value],['type',resource.resourceType?.value||resource.resourceType?.typeGeneral],['year',resource.publicationYear],['publisher',resource.publisher],['creator',creator],['state',resource.state]];
+ const list=$('#metadata-view');list.replaceChildren();for(const[key,value]of rows)list.append(resourceLabel('dt','resourceDynamic.'+key),resourceNode('dd',value||'—'));
+}
+function renderScientificIdentity(){
+  const title=resource.titles?.[0]?.value||'Sin título';
+  const creators=resource.creators?.map(x=>[x.givenName,x.familyName].filter(Boolean).join(' ')).filter(Boolean)||[];
+  const doi=scientific?.versionDoi || (resource.identifier?.identifierType==='DOI' && /^10\.\d{4,9}\/.+/.test(resource.identifier?.value||'') ? resource.identifier.value : null);
+  const labels={DRAFT:'resourceDynamic.draft',IN_REVIEW:'resourceDynamic.review',PUBLISHED:'resourceDynamic.published',RESTRICTED:'resourceDynamic.restricted',WITHDRAWN:'resourceDynamic.withdrawn'};
+  const status=labels[scientific?.status];
+  if(status)uiI18n.set($('#publication-status'),status);else if(scientific?.status)uiI18n.plain($('#publication-status'),scientific.status);else uiI18n.set($('#publication-status'),'resourceDynamic.draft');
+  uiI18n.set($('#resource-creators'),creators.length?'resourceDynamic.authors':'resourceDynamic.noAuthors',{authors:creators.join(', ')});
+  const doiNode=$('#resource-doi'); uiI18n.plain(doiNode,'');doiNode.replaceChildren();
+  if(doi && scientific?.status==='PUBLISHED'){const link=document.createElement('a');link.href=`https://doi.org/${doi.split('/').map(encodeURIComponent).join('/')}`;link.textContent=`DOI: ${doi}`;link.rel='noopener noreferrer';doiNode.append(link)}
+  else if(doi) uiI18n.set(doiNode,'resourceDynamic.assignedDoi',{doi});
+  else uiI18n.set(doiNode,'resourceDynamic.noDoi');
+  uiI18n.set($('#resource-version'),scientific?.versionLabel?'resourceDynamic.version':'resourceDynamic.noVersion',{value:scientific?.versionLabel});
+  uiI18n.set($('#resource-license'),scientific?.licenseId?'resourceDynamic.license':'resourceDynamic.noLicense',{value:scientific?.licenseId});
+  uiI18n.set($('#resource-access'),scientific?.accessLevel?'resourceDynamic.access':'resourceDynamic.noAccess',{value:scientific?.accessLevel});
+  uiI18n.set($('#resource-institution'),scientific?.institution?'resourceDynamic.institution':'resourceDynamic.noInstitution',{value:scientific?.institution});
+  const citation=`${creators.join(', ')||'Autor no informado'} (${resource.publicationYear||'s. f.'}). ${title} (versión ${scientific?.versionLabel||'no informada'}) [${resource.resourceType?.typeGeneral||'Recurso'}]. ${resource.publisher||'Editorial no informada'}.${doi && scientific?.status==='PUBLISHED' ? ` https://doi.org/${doi}` : ''}`;
+  $('#suggested-citation').textContent=citation;
+  $('#citation-exports').hidden=scientific?.status!=='PUBLISHED';
+  $('#edit-science').hidden=!isOwner || scientific?.status!=='DRAFT';
+  reserveDoiButton.hidden=!doiEnabled || !isOwner || scientific?.status!=='DRAFT';
+  $('#submit-science').hidden=!isOwner || scientific?.status!=='DRAFT';
+  $('#new-version').hidden=!isOwner || scientific?.status!=='PUBLISHED';
+  if(doiEnabled)loadDoiStatus();else uiI18n.plain(doiStatus,'');
+  document.querySelectorAll('.resource-page-header [data-open-modal],.detail-layout [data-open-modal],.delete-file').forEach(button=>{button.hidden=!isOwner || scientific?.status!=='DRAFT'});
+  $('#copy-citation').onclick=async()=>{try{await navigator.clipboard.writeText(citation);messageKey('resourceDynamic.copied','success')}catch{messageKey('resourceDynamic.copyFailure','error')}};
+}
+function fillEditForm(){const f=$('#metadata-form');f.title.value=resource.titles?.[0]?.value||'';f.year.value=resource.publicationYear||'';f.type.value=resource.resourceType?.typeGeneral||'OTHER';f.publisher.value=resource.publisher||'';f.givenName.value=resource.creators?.[0]?.givenName||'';f.familyName.value=resource.creators?.[0]?.familyName||'';f.description.value=resource.descriptions?.[0]?.value||''}
+const policies={IMAGE:{accept:'.jpg,.jpeg,.png,.gif,.webp,.svg,.tif,.tiff,.bmp',hint:'resourceDynamic.policyImage'},TEXT:{accept:'.pdf,.doc,.docx,.odt,.rtf,.txt,.md,.epub',hint:'resourceDynamic.policyText'},AUDIOVISUAL:{accept:'.mp4,.webm,.mov,.avi,.mkv,.mpeg,.mpg,.m4v',hint:'resourceDynamic.policyVideo'},DATASET:{accept:'.csv,.tsv,.tab,.xls,.xlsx,.ods,.parquet,.sav,.dta,.json,.xml',hint:'resourceDynamic.policyDataset'},OTHER:{accept:'',hint:'resourceDynamic.policyOther'}};
+function applyFilePolicy(){const policy=policies[resource?.resourceType?.typeGeneral]||policies.OTHER;$('#resource-files').accept=policy.accept ? `${policy.accept},.zip` : '.zip,*/*';$('#resource-file-hint').replaceChildren(resourceLabel('span',policy.hint),resourceNode('span',' '),resourceLabel('span','resourceDynamic.zipPolicy'));}
+async function loadDoiStatus(){try{const state=await api(`/api/v1/scientific/${encodeURIComponent(resourceId)}/doi`);latestDoiStatus=state;renderDoiEvidence();uiI18n.set(doiStatus,state.versionState==='NOT_REQUESTED'?'resourceDynamic.notReserved':'resourceDynamic.doiStates',{version:state.versionState,concept:state.conceptualState});}catch{uiI18n.set(doiStatus,'resourceDynamic.doiFailure')}}
+reserveDoiButton.addEventListener('click',async()=>{if(!confirm(uiI18n.t('resourceDynamic.reserveConfirm')))return;reserveDoiButton.disabled=true;try{const state=await api(`/api/v1/scientific/${encodeURIComponent(resourceId)}/doi/reserve`,{method:'POST'});messageKey(state.versionState==='DRAFT'&&state.conceptualState==='DRAFT'?'resourceDynamic.reserved':'resourceDynamic.reconciled','success');await load()}catch(error){messageFailure(error)}finally{reserveDoiButton.disabled=false}});
+const resourceDates=new Map();
+function resourceDate(value){const node=resourceNode('span');resourceDates.set(node,value);formatResourceDate(node,value);return node;}
+function formatResourceDate(node,value){const date=new Date(value);node.textContent=Number.isNaN(date.getTime())?String(value):date.toLocaleString(uiI18n.locale);}
+window.addEventListener('ui-locale-changed',()=>{for(const[node,value]of resourceDates){if(node.isConnected)formatResourceDate(node,value);else resourceDates.delete(node);}});
+async function loadHistory(){
+ if($('#history-panel').hidden)return;
+ try{
+  const events=await api(`/api/v1/scientific/${encodeURIComponent(resourceId)}/history`),list=$('#history-list');uiI18n.plain(list,'');
+  const labels={METADATA_UPDATED:'resourceDynamic.historyMETADATA_UPDATED',SUBMITTED:'resourceDynamic.historySUBMITTED',VERSION_DERIVED:'resourceDynamic.historyVERSION_DERIVED',RETURNED_TO_DRAFT:'resourceDynamic.historyRETURNED_TO_DRAFT',PUBLISHED:'resourceDynamic.historyPUBLISHED',WITHDRAWN:'resourceDynamic.historyWITHDRAWN'};
+  for(const event of events){const item=resourceNode('li');item.append(resourceDate(event.createdAt),resourceNode('span',' · '),Object.hasOwn(labels,event.action)?resourceLabel('span',labels[event.action]):resourceNode('span',event.action),resourceNode('span',` · ${event.actor}${event.detail?` · ${event.detail}`:''}`));list.append(item);}
+  if(!events.length)list.append(resourceLabel('li','resourceDynamic.emptyHistory'));
+ }catch(error){uiI18n.plain($('#history-list'),'');uiI18n.set($('#history-list'),'resourceDynamic.historyFailure');}
+}
+const resourceQualityCodes=new Set(['title','authors','version','license','institution','methodology','description','files','doi','orcid','ror','summary','coverage']);
+const resourceProfileFields=new Set(['summary','language','discipline','keywords','productionDescription','processingDescription','processingTools','temporalStart','temporalEnd','geographicCoverage','translations']);
+function resourceCheckLabel(check){if(resourceQualityCodes.has(check.code))return resourceLabel('span',`quality.${check.code}`);const field=check.code?.startsWith('profile:')?check.code.slice(8):null;return resourceProfileFields.has(field)?resourceLabel('span',`quality.profile.${field}`):resourceNode('span',check.label);}
+let lastQualityReport=null;
+function readinessTarget(code){
+ if(code==='description')return ['description-section','[data-open-modal="description-modal"]','readiness.goDescription'];
+ if(code==='files')return ['files-section','[data-open-modal="files-modal"]','readiness.goFiles'];
+ if(['authors','orcid','ror'].includes(code))return ['authors-section','button','readiness.goAuthors'];
+ if(code==='title')return ['resource-title','[data-open-modal="edit-modal"]','readiness.goMetadata'];
+ return ['science-section','#edit-science','readiness.goMetadata'];
+}
+let readinessHighlightTimer;
+function goToReadinessTarget(code){
+ const [id,selector]=readinessTarget(code),target=document.getElementById(id)||$('#science-section');
+ document.querySelectorAll('.readiness-highlight').forEach(node=>node.classList.remove('readiness-highlight'));clearTimeout(readinessHighlightTimer);
+ target.classList.add('readiness-highlight');target.setAttribute('tabindex','-1');
+ target.scrollIntoView({behavior:matchMedia('(prefers-reduced-motion: reduce)').matches?'instant':'smooth',block:'start'});
+ const control=code==='title'?document.querySelector(selector):target.querySelector(selector);
+ (control&&!control.hidden?control:target).focus({preventScroll:true});
+ readinessHighlightTimer=setTimeout(()=>target.classList.remove('readiness-highlight'),3000);
+}
+function renderQuality(report){
+ const checks=report.checks||[],required=checks.filter(check=>check.required&&!check.complete),recommended=checks.filter(check=>!check.required&&!check.complete),complete=checks.filter(check=>check.complete);
+ $('#quality-progress').value=report.completionPercent;uiI18n.plain($('#quality-summary'),'');$('#quality-summary').append(resourceLabel('span','resourceDynamic.quality',{percent:report.completionPercent}));uiI18n.set($('#quality-pending-count'),'readiness.pendingCount',{count:required.length});
+ const list=$('#quality-checks');list.replaceChildren();const editable=isOwner&&scientific?.status==='DRAFT';
+ function card(check){
+  const item=resourceNode('article','',check.required?'readiness-card':'readiness-card readiness-recommendation'),body=resourceNode('div','','readiness-card-body'),heading=resourceNode('div','','readiness-card-heading'),title=resourceNode('h4');
+  if(['description','files'].includes(check.code))uiI18n.set(title,'readiness.missing.'+check.code);else title.append(resourceCheckLabel(check));
+  if(['description','files'].includes(check.code)){const icon=resourceNode('span',check.code==='description'?'▤':'▦','readiness-icon');icon.setAttribute('aria-hidden','true');heading.append(icon);}heading.append(title,resourceLabel('span',check.required?'readiness.required':'readiness.optional',{},'readiness-badge'));body.append(heading);
+  if(check.explanation)body.append(resourceQualityCodes.has(check.code)?resourceLabel('p',`quality.${check.code}.explanation`):check.code?.startsWith('profile:')?resourceLabel('p','quality.profileExplanation'):resourceNode('p',check.explanation));
+  const help=resourceNode(check.required?'div':'details','','readiness-help');help.append(resourceLabel(check.required?'strong':'summary','readiness.how'));
+  const helpKey=['description','files','title','authors','orcid','ror','doi'].includes(check.code)?check.code:'metadata';
+  const formatKey=['DATASET','IMAGE','TEXT','AUDIOVISUAL'].includes(resource?.resourceType?.typeGeneral)?resource.resourceType.typeGeneral:'OTHER';
+  help.append(resourceLabel('p','readiness.help.'+helpKey,{formats:uiI18n.t('readiness.formats.'+formatKey)}));body.append(help);item.append(body);
+  if(editable){const action=resourceLabel('button',readinessTarget(check.code)[2]);action.type='button';action.className=check.required?'primary':'secondary';action.dataset.readinessCode=check.code;action.onclick=()=>goToReadinessTarget(check.code);item.append(action);}return item;
+ }
+ for(const [items,key]of [[required,'readiness.needed'],[recommended,'readiness.recommendations']]){
+  if(!items.length)continue;const section=resourceNode('section','','readiness-group'),heading=resourceNode('div','','readiness-group-heading');heading.append(resourceLabel('h3',key),resourceLabel('span',items===required?'readiness.requiredCount':'readiness.nonBlocking',{count:items.length},'readiness-badge'));section.append(heading);for(const check of items)section.append(card(check));list.append(section);
+ }
+ if(!required.length)list.prepend(resourceLabel('p','readiness.allRequiredComplete',{},'readiness-ready'));
+ if(!editable)list.append(resourceLabel('p','readiness.readOnly',{},'muted'));
+ if(complete.length){const details=resourceNode('details','','readiness-complete');details.append(resourceLabel('summary','readiness.completedCount',{count:complete.length}));const ul=resourceNode('ul');for(const check of complete){const item=resourceNode('li');item.append(resourceNode('span','✓ '),resourceCheckLabel(check));if(check.explanation)item.append(resourceQualityCodes.has(check.code)?resourceLabel('p',`quality.${check.code}.explanation`):resourceNode('p',check.explanation));ul.append(item);}details.append(ul);list.append(details);}
+}
+async function loadQuality(){
+ const refresh=$('#refresh-quality');refresh.disabled=true;
+ try{const report=await api(`/api/v1/scientific/${encodeURIComponent(resourceId)}/quality`);if(!Array.isArray(report.checks)||!Number.isFinite(report.completionPercent)||report.completionPercent<0||report.completionPercent>100)throw uiI18n.error('resourceDynamic.qualityFailure');lastQualityReport=report;renderQuality(report);}
+ catch(error){lastQualityReport=null;$('#quality-checks').replaceChildren();$('#quality-progress').value=0;uiI18n.plain($('#quality-pending-count'),'');uiI18n.plain($('#quality-summary'),'');uiI18n.set($('#quality-summary'),'resourceDynamic.qualityFailure');toast.errorObject(error);}
+ finally{refresh.disabled=false;}
+}
+$('#refresh-quality').addEventListener('click',()=>loadQuality());
+window.addEventListener('ui-locale-changed',()=>{if(lastQualityReport)renderQuality(lastQualityReport);});
+
+async function load(){$('#main-content').setAttribute('aria-busy','true');try{resource=await api(`/api/v1/dataresources/${encodeURIComponent(resourceId)}`);scientific=await api(`/api/v1/scientific/${encodeURIComponent(resourceId)}`);content=await api(`/api/v1/dataresources/${encodeURIComponent(resourceId)}/data/`,{headers:{Accept:'application/vnd.datamanager.content-information+json'}});if(resource.titles?.[0]?.value)uiI18n.plain($('#resource-title'),resource.titles[0].value);else uiI18n.set($('#resource-title'),'resourceDynamic.untitled');$('#resource-id').textContent=resource.id;applyFilePolicy();renderMetadata();renderFiles();renderScientificIdentity();document.dispatchEvent(new CustomEvent('scientific-record-loaded',{detail:{scientific,isOwner}}));await loadQuality();await loadHistory();const md=markdownItem();if(!md){$('#markdown-rendered').replaceChildren(resourceLabel('p','resourceDynamic.missingMarkdown',{},'empty'));return true}const r=await fetch(contentPath(md),{headers:auth.headers()});if(!r.ok)throw uiI18n.error('resourceDynamic.markdownFailure');$('#markdown-rendered').innerHTML=renderMarkdown(await r.text());await hydrateMarkdownImages();return true}catch(e){messageFailure(e);return false}finally{$('#main-content').setAttribute('aria-busy','false')}}
+$('#markdown-form').addEventListener('submit',async e=>{e.preventDefault();const file=new FormData(e.currentTarget).get('markdown');try{await transfers.upload(`/api/v1/dataresources/${encodeURIComponent(resourceId)}/description`,file,uiI18n.t('resourceDynamic.projectDescription'));$('#description-modal').close();messageKey('resourceDynamic.descriptionUpdated','success');load()}catch(err){messageFailure(err)}});
+$('#files-form').addEventListener('submit',async e=>{e.preventDefault();try{for(const file of new FormData(e.currentTarget).getAll('files')){if(!file.size)continue;await transfers.upload(`/api/v1/dataresources/${encodeURIComponent(resourceId)}/attachments?path=${encodeURIComponent(file.webkitRelativePath||file.name)}`,file)}$('#files-modal').close();messageKey('resourceDynamic.filesAdded','success');load()}catch(err){messageFailure(err)}});
+function openFileDelete(path){fileForDeletion=content.find(x=>x.relativePath===path);uiI18n.set($('#file-delete-text'),'resourceDynamic.fileDelete',{path});$('#file-delete-modal').showModal()}
+$('#confirm-file-delete').addEventListener('click',async()=>{try{const etag=fileForDeletion.etag||fileForDeletion.eTag;if(!etag)throw uiI18n.error('resourceDynamic.fileVersionMissing');await api(`/api/v1/dataresources/${encodeURIComponent(resourceId)}/data/${fileForDeletion.relativePath.split('/').map(encodeURIComponent).join('/')}`,{method:'DELETE',headers:{'If-Match':`"${etag.replaceAll('"','')}"`}});$('#file-delete-modal').close();messageKey('resourceDynamic.fileDeleted','success');load()}catch(err){messageFailure(err)}});
+$('#metadata-form').addEventListener('submit',async e=>{e.preventDefault();const f=new FormData(e.currentTarget),updated=structuredClone(resource);updated.titles=[{...(resource.titles?.[0]||{}),value:f.get('title').trim()}];updated.publicationYear=f.get('year').trim();updated.publisher=f.get('publisher').trim();updated.creators=[{...(resource.creators?.[0]||{}),givenName:f.get('givenName').trim(),familyName:f.get('familyName').trim()},...(resource.creators||[]).slice(1)];updated.resourceType={...(resource.resourceType||{}),value:f.get('type'),typeGeneral:f.get('type')};updated.descriptions=f.get('description').trim()?[{value:f.get('description').trim(),descriptionType:'OTHER'}]:[];try{const current=await fetch(`/api/v1/dataresources/${encodeURIComponent(resourceId)}`,{headers:auth.headers()});const etag=current.headers.get('ETag');if(!current.ok||!etag)throw uiI18n.error('resourceDynamic.currentVersionFailure');await api(`/api/v1/dataresources/${encodeURIComponent(resourceId)}`,{method:'PUT',headers:{'Content-Type':'application/json','If-Match':etag},body:JSON.stringify(updated)});$('#edit-modal').close();messageKey('resourceDynamic.metadataUpdated','success');load()}catch(err){messageFailure(err)}});
+async function download(e){const path=e.currentTarget.dataset.path;try{await transfers.download(`/api/v1/dataresources/${encodeURIComponent(resourceId)}/data/${path.split('/').map(encodeURIComponent).join('/')}`,path.split('/').pop(),path)}catch(err){messageFailure(err)}}
+$('#confirm-delete').addEventListener('click',async()=>{try{await api(`/api/v1/dataresources/${encodeURIComponent(resourceId)}`,{method:'DELETE'});location.assign('index.html')}catch(e){messageFailure(e)}});
+$('#edit-science').addEventListener('click',()=>{const form=$('#scientific-form');for(const field of form.elements){if(field.name && field.name!=='translations')field.value=scientific?.[field.name]??''}translationEditor.set(scientific?.translations||{});for(const name of ['versionDoi','conceptualDoi'])form.elements[name].closest('label').hidden=doiEnabled;$('#scientific-modal').showModal()});
+$('#scientific-form').addEventListener('submit',async event=>{event.preventDefault();const body=Object.fromEntries(new FormData(event.currentTarget));body.translations=translationEditor.get();if(doiEnabled){delete body.versionDoi;delete body.conceptualDoi}try{scientific=await api(`/api/v1/scientific/${encodeURIComponent(resourceId)}`,{method:'PUT',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});$('#scientific-modal').close();renderScientificIdentity();renderMetadata();await loadQuality();await loadHistory();messageKey('resourceDynamic.scienceSaved','success')}catch(error){messageFailure(error)}});
+function previewNode(tag,text){const element=document.createElement(tag);element.textContent=text;return element}
+$('#submit-science').addEventListener('click',async()=>{
+ const dialog=$('#submit-preview-modal'),target=$('#submit-preview-content'),confirmButton=$('#confirm-submit-science');
+ confirmButton.disabled=true;target.replaceChildren(resourceLabel('p','resourceDynamic.previewLoading'));dialog.showModal();
+ try{
+  if(!await load())throw uiI18n.error('resourceDynamic.refreshFailure');
+  const report=await api(`/api/v1/scientific/${encodeURIComponent(resourceId)}/quality`);target.replaceChildren();
+  target.append(resource.titles?.[0]?.value?previewNode('h3',resource.titles[0].value):resourceLabel('h3','resourceDynamic.untitled'));
+  const authors=resource.creators?.map(author=>[author.givenName,author.familyName].filter(Boolean).join(' ')).join(', ');
+  const byline=previewNode('p','');byline.append(authors?previewNode('span',authors):resourceLabel('span','resourceDynamic.noAuthors'),previewNode('span',' · '),resource.publisher?previewNode('span',resource.publisher):resourceLabel('span','resourceDynamic.noPublisher'),previewNode('span',' · '),resource.publicationYear?previewNode('span',resource.publicationYear):resourceLabel('span','resourceDynamic.noYear'));target.append(byline);
+  target.append(resourceLabel('p','resourceDynamic.previewIdentity',{type:resource.resourceType?.typeGeneral||'OTHER',version:scientific?.versionLabel||'—',license:scientific?.licenseId||'—'}),resourceLabel('p','resourceDynamic.previewAccess',{institution:scientific?.institution||'—',access:scientific?.accessLevel||'OPEN'}));
+  for(const[key,label]of [['productionDescription','resourceDynamic.previewProduction'],['processingDescription','resourceDynamic.previewProcessing'],['processingTools','resourceDynamic.previewTools']])if(scientific?.[key])target.append(resourceLabel('p',label,{value:scientific[key]}));
+  target.append(resourceLabel('p','resourceDynamic.previewMethods',{value:scientific?.methodology||'—'}),resourceLabel('h3','resourceDynamic.projectDescription'));
+  if(markdownItem()){const description=$('#markdown-rendered').cloneNode(true);description.removeAttribute('id');description.classList.add('wizard-markdown');target.append(description);}else target.append(resourceLabel('p','resourceDynamic.missingMarkdown'));
+  target.append(resourceLabel('h3','resourceDynamic.datasetFiles'));
+  const listing=document.createElement('ul');for(const file of content.filter(item=>item.relativePath!=='description.md'&&!item.relativePath.startsWith('description/')))listing.append(previewNode('li',`${file.relativePath} · ${file.size??0} bytes`));
+  if(!listing.childElementCount)listing.append(resourceLabel('li','resourceDynamic.emptyData'));target.append(listing);
+  const blockers=report.blockers||[],validation=resourceLabel('p',blockers.length?'resourceDynamic.previewBlocked':'resourceDynamic.previewReady',{blockers:blockers.join(', '),percent:report.completionPercent});validation.className=blockers.length?'quality-missing':'quality-ok';target.append(validation);confirmButton.disabled=blockers.length>0;
+ }catch(error){const failure=resourceLabel('p','resourceDynamic.previewFailure'),detail=previewNode('p','');uiI18n.showError(detail,error);target.replaceChildren(failure,detail);}
+});
+$('#confirm-submit-science').addEventListener('click',async()=>{
+  const button=$('#confirm-submit-science');button.disabled=true;
+  try{scientific=await api(`/api/v1/scientific/${encodeURIComponent(resourceId)}/submit`,{method:'POST'});$('#submit-preview-modal').close();renderScientificIdentity();document.dispatchEvent(new CustomEvent('scientific-record-loaded',{detail:{scientific,isOwner}}));await loadQuality();await loadHistory();messageKey('resourceDynamic.submitted','success')}
+  catch(error){button.disabled=false;messageFailure(error)}
+});
+$('#new-version').addEventListener('click',()=>location.assign(`create.html?basedOn=${encodeURIComponent(resourceId)}`));
+$('#download-citation').addEventListener('click',async()=>{const format=$('#citation-format').value;try{await transfers.download(`/api/v1/scientific/${encodeURIComponent(resourceId)}/citation?format=${encodeURIComponent(format)}`,`citation-${resourceId}.${({bibtex:'bib',ris:'ris','csl-json':'json'})[format]||'txt'}`,uiI18n.t('resourceDynamic.citationName'));toast.successKey('resourceDynamic.citationExported')}catch(error){toast.errorObject(error)}});
+async function enforceAuthorControls(){try{const mine=await api('/api/v1/my-dataresources');isOwner=mine.some(item=>item.id===resourceId);if(scientific)renderScientificIdentity();$('#history-panel').hidden=!isOwner && !['CURATOR','ADMINISTRATOR'].includes(user?.role);await loadHistory();document.dispatchEvent(new CustomEvent('scientific-record-loaded',{detail:{scientific,isOwner}}));if(!isOwner)messageKey('resourceDynamic.readOnly')}catch{}}
+api('/api/v1/scientific/doi/config').then(configuration=>{doiEnabled=Boolean(configuration.enabled)}).catch(()=>{}).finally(()=>{load();enforceAuthorControls()});

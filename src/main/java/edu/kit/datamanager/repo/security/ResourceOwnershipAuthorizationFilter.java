@@ -1,0 +1,104 @@
+package edu.kit.datamanager.repo.security;
+
+import com.fasterxml.jackson.databind.ObjectMapper;
+import edu.kit.datamanager.repo.repository.ResourceOwnershipRepository;
+import edu.kit.datamanager.repo.repository.ScientificRecordRepository;
+import org.springframework.security.authentication.UsernamePasswordAuthenticationToken;
+import edu.kit.datamanager.repo.domain.PublicationStatus;
+import java.time.Instant;
+import jakarta.servlet.FilterChain;
+import jakarta.servlet.ServletException;
+import jakarta.servlet.http.HttpServletRequest;
+import jakarta.servlet.http.HttpServletResponse;
+import java.io.IOException;
+import org.springframework.http.HttpMethod;
+import org.springframework.security.core.context.SecurityContextHolder;
+import org.springframework.stereotype.Component;
+import org.springframework.web.filter.OncePerRequestFilter;
+
+/** Restricts resource mutations to the user recorded as its author. */
+@Component
+public class ResourceOwnershipAuthorizationFilter extends OncePerRequestFilter {
+    private final ResourceOwnershipRepository ownership;
+    private final ScientificRecordRepository scientificRecords;
+    private final ObjectMapper json = new ObjectMapper();
+    public ResourceOwnershipAuthorizationFilter(ResourceOwnershipRepository ownership, ScientificRecordRepository scientificRecords) {
+        this.ownership = ownership;
+        this.scientificRecords = scientificRecords;
+    }
+    private static boolean legacyCollection(String path,String method) {
+        return ((HttpMethod.GET.matches(method)||HttpMethod.HEAD.matches(method))&&path.matches("/api/v1/dataresources/?")) ||
+            (HttpMethod.POST.matches(method)&&path.matches("/api/v1/dataresources/search(?:/data)?/?"));
+    }
+    @Override protected boolean shouldNotFilter(HttpServletRequest request) {
+        String path = ResourceRequestPath.path(request); String method = request.getMethod();
+        if (legacyCollection(path,method)) return false;
+        if (!path.startsWith("/api/v1/dataresources/")) return true;
+        boolean read = HttpMethod.GET.matches(method) || HttpMethod.HEAD.matches(method);
+        return !(read || HttpMethod.PUT.matches(method) || HttpMethod.PATCH.matches(method) || HttpMethod.DELETE.matches(method)
+                || (HttpMethod.POST.matches(method) && (path.contains("/data/") || path.endsWith("/description") || path.endsWith("/attachments"))));
+    }
+    @Override protected void doFilterInternal(HttpServletRequest request, HttpServletResponse response, FilterChain chain) throws ServletException, IOException {
+        if (legacyCollection(ResourceRequestPath.path(request),request.getMethod())) {
+            var actor=SecurityContextHolder.getContext().getAuthentication();
+            if (actor instanceof UsernamePasswordAuthenticationToken && actor.getAuthorities().stream().noneMatch(a->java.util.Set.of("ROLE_CURATOR","ROLE_ADMINISTRATOR").contains(a.getAuthority()))) {
+                response.setStatus(HttpServletResponse.SC_FORBIDDEN);response.setContentType("application/json;charset=UTF-8");
+                json.writeValue(response.getWriter(),java.util.Map.of("message","Utilice el catálogo científico o Mis depósitos para consultar recursos."));return;
+            }
+            chain.doFilter(request,response);return;
+        }
+        String remainder = ResourceRequestPath.path(request).substring("/api/v1/dataresources/".length());
+        String resourceId = remainder.split("/", 2)[0];
+        boolean contentRead = (HttpMethod.GET.matches(request.getMethod()) || HttpMethod.HEAD.matches(request.getMethod()))
+                && (remainder.contains("/data/") || remainder.endsWith("/archive"));
+        boolean read = HttpMethod.GET.matches(request.getMethod()) || HttpMethod.HEAD.matches(request.getMethod());
+        if (read) {
+            var record = scientificRecords.findById(resourceId);
+            if (record.isPresent()) {
+                var science = record.get();
+                boolean published = science.getStatus() == PublicationStatus.PUBLISHED;
+                boolean publiclyReadable = published && (!contentRead || "OPEN".equals(science.getAccessLevel()) ||
+                        ("EMBARGOED".equals(science.getAccessLevel()) && science.getEmbargoUntil() != null
+                                && !science.getEmbargoUntil().isAfter(Instant.now())));
+                if (!publiclyReadable) {
+                    var authentication = SecurityContextHolder.getContext().getAuthentication();
+                    String username = authentication == null ? "" : authentication.getName();
+                    boolean owner = ownership.findById(resourceId).filter(item -> item.getUsername().equalsIgnoreCase(username)).isPresent();
+                    boolean curator = authentication != null && authentication.getAuthorities().stream().anyMatch(authority ->
+                            "ROLE_CURATOR".equals(authority.getAuthority()) || "ROLE_ADMINISTRATOR".equals(authority.getAuthority()));
+                    logger.debug("Scientific content guard: status=" + science.getStatus() + ", owner=" + owner + ", curator=" + curator);
+                    if (!owner && !curator) {
+                        // A legacy/public ACL must not reopen draft or withdrawn scientific records.
+                        response.setStatus(published ? HttpServletResponse.SC_FORBIDDEN : HttpServletResponse.SC_NOT_FOUND);
+                        response.setContentType("application/json");
+                        json.writeValue(response.getWriter(), java.util.Map.of("message", published
+                                ? "Los archivos no son de acceso abierto." : "Contenido científico no disponible."));
+                        return;
+                    }
+                }
+            }
+            chain.doFilter(request, response);
+            return;
+        }
+        if (SecurityContextHolder.getContext().getAuthentication() == null) { chain.doFilter(request, response); return; }
+        String username = SecurityContextHolder.getContext().getAuthentication().getName();
+        PublicationStatus status = scientificRecords.findById(resourceId).map(record -> record.getStatus()).orElse(PublicationStatus.DRAFT);
+        if (status != PublicationStatus.DRAFT) {
+            response.setStatus(HttpServletResponse.SC_CONFLICT); response.setContentType("application/json");
+            json.writeValue(response.getWriter(), java.util.Map.of("message", "El recurso no es un borrador editable. Una versión publicada no puede modificarse ni eliminarse; solicite su retirada.")); return;
+        }
+        // Existing trusted-service identities remain governed by upstream
+        // DataResource ACLs. Local login issues UsernamePassword tokens.
+        if (!(SecurityContextHolder.getContext().getAuthentication() instanceof UsernamePasswordAuthenticationToken)) {
+            chain.doFilter(request, response); return;
+        }
+        boolean administrator = SecurityContextHolder.getContext().getAuthentication().getAuthorities().stream()
+                .anyMatch(authority -> "ROLE_ADMINISTRATOR".equals(authority.getAuthority()));
+        boolean owner = ownership.findById(resourceId).filter(item -> item.getUsername().equalsIgnoreCase(username)).isPresent();
+        if (!owner && !(administrator && HttpMethod.DELETE.matches(request.getMethod()) && remainder.indexOf('/') < 0)) {
+            response.setStatus(HttpServletResponse.SC_FORBIDDEN); response.setContentType("application/json");
+            json.writeValue(response.getWriter(), java.util.Map.of("message", "Solo el autor del recurso puede modificarlo.")); return;
+        }
+        chain.doFilter(request, response);
+    }
+}

@@ -1,0 +1,1437 @@
+#!/usr/bin/env node
+/* Real browser + backend smoke test. Never connects to a deployed instance. */
+const fs = require('node:fs');
+const os = require('node:os');
+const path = require('node:path');
+const net = require('node:net');
+const crypto = require('node:crypto');
+const {spawn, spawnSync} = require('node:child_process');
+const puppeteer = require('../a11y/node_modules/puppeteer-core');
+const axe=require('../a11y/node_modules/axe-core');
+const {validate:validateOpenApi}=require('../contract/openapi-check.cjs');
+const contractCompatibility=require('../contract/compatibility-check.cjs');
+
+const root = path.resolve(__dirname, '../..');
+const jar = process.env.E2E_JAR ? path.resolve(process.env.E2E_JAR) : path.join(root, 'build/libs/base-repo.jar');
+const chrome = process.env.CHROME_BIN || '/usr/bin/google-chrome';
+const java = process.env.JAVA_BIN || '/usr/lib/jvm/java-21-openjdk-amd64/bin/java';
+const password = crypto.randomBytes(24).toString('hex');
+const username = 'e2e-admin';
+const temp = fs.mkdtempSync(path.join(os.tmpdir(), 'reduniv-wizard-'));
+let app;
+let browser;
+let postgres;
+let smtp;
+const verificationMessages = [];
+let rejectSmtp = false;
+let verifiedAccount;
+
+function assert(condition, message) { if (!condition) throw new Error(message); }
+function observeResponse(page, predicate) {
+  const pending=page.waitForResponse(predicate);
+  // Keep failures observable to the awaiting assertion, but avoid unhandled rejection
+  // when a preceding click fails and cleanup closes the browser first.
+  pending.catch(()=>{});
+  return pending;
+}
+function sleep(ms) { return new Promise(resolve => setTimeout(resolve, ms)); }
+function freePort() {
+  return new Promise((resolve, reject) => {
+    const server = net.createServer();
+    server.once('error', reject);
+    server.listen(0, '127.0.0.1', () => {
+      const port = server.address().port;
+      server.close(error => error ? reject(error) : resolve(port));
+    });
+  });
+}
+function setupFiles() {
+  const data = path.join(temp, 'data');
+  const description = path.join(temp, 'description.md');
+  const csv1 = path.join(temp, 'datos-uno.csv');
+  const csv2 = path.join(temp, 'datos-dos.csv');
+  fs.mkdirSync(data);
+  fs.writeFileSync(description, '# Descripción de prueba\n\nDatos de demostración.\n');
+  fs.writeFileSync(csv1, 'nombre,valor\nuno,1\n');
+  fs.writeFileSync(csv2, 'nombre,valor\ndos,2\n');
+  const packageDir = path.join(temp, 'package');
+  fs.mkdirSync(path.join(packageDir, 'description'), {recursive:true});
+  fs.writeFileSync(path.join(packageDir, 'description.md'),
+    '# Descripción con imagen\n\n![Gráfico](description/chart.png)\n');
+  fs.writeFileSync(path.join(packageDir, 'description/chart.png'), Buffer.from(
+    'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVQIHWP4z8DwHwAFgAI/ScL/nwAAAABJRU5ErkJggg==', 'base64'));
+  const zip = path.join(temp, 'project-description.zip');
+  const packed = spawnSync('zip', ['-q', '-r', zip, 'description.md', 'description'], {cwd:packageDir});
+  assert(packed.status === 0, 'No se pudo crear el ZIP de prueba; instale zip.');
+  const fullDir = path.join(temp, 'full-package');
+  fs.mkdirSync(path.join(fullDir, 'description'), {recursive:true});
+  fs.writeFileSync(path.join(fullDir, 'description/description.md'), '# Paquete completo\n\n![Gráfico](chart.png)\n');
+  fs.copyFileSync(path.join(packageDir, 'description/chart.png'), path.join(fullDir, 'description/chart.png'));
+  fs.copyFileSync(csv1, path.join(fullDir, 'datos-uno.csv'));
+  fs.copyFileSync(csv2, path.join(fullDir, 'datos-dos.csv'));
+  const fullZip = path.join(temp, 'dataset-completo.zip');
+  const fullPacked = spawnSync('zip', ['-q', '-r', fullZip, 'description', 'datos-uno.csv', 'datos-dos.csv'], {cwd:fullDir});
+  assert(fullPacked.status === 0, 'No se pudo crear el ZIP completo de prueba.');
+  const missingDescriptionZip = path.join(temp, 'sin-descripcion.zip');
+  assert(spawnSync('zip', ['-q', missingDescriptionZip, 'datos-uno.csv'], {cwd:fullDir}).status === 0,
+    'No se pudo preparar ZIP sin descripción.');
+  fs.writeFileSync(path.join(fullDir, 'invalido.exe'), 'No debe aceptarse.');
+  const invalidTypeZip = path.join(temp, 'tipo-invalido.zip');
+  assert(spawnSync('zip', ['-q', '-r', invalidTypeZip, 'description', 'datos-uno.csv', 'invalido.exe'], {cwd:fullDir}).status === 0,
+    'No se pudo preparar ZIP de tipo inválido.');
+  const crafted = (filename, kind) => {
+    const archive = path.join(temp, filename);
+    const program = `import sys,zipfile\nwith zipfile.ZipFile(sys.argv[1],'w') as z:\n k=sys.argv[2]\n if k=='description-traversal':\n  z.writestr('description.md','# Prueba\\n'); z.writestr('folder/../chart.png',b'png')\n elif k=='description-duplicate':\n  z.writestr('description.md','# Uno\\n'); z.writestr('description.md','# Dos\\n')\n elif k=='description-html':\n  z.writestr('description.md','# Prueba\\n'); z.writestr('script.html','<script></script>')\n elif k=='package-traversal':\n  z.writestr('description/description.md','# Prueba\\n'); z.writestr('datos-uno.csv','a,b\\n1,2\\n'); z.writestr('../fuera.csv','x,y\\n3,4\\n')\n`;
+    const result = spawnSync('python3', ['-c', program, archive, kind], {encoding:'utf8'});
+    assert(result.status === 0, `No se pudo crear ZIP malicioso ${kind}: ${result.stderr}`);
+    return archive;
+  };
+  return {data, description, csv1, csv2, zip, fullZip, missingDescriptionZip, invalidTypeZip,
+    descriptionTraversalZip:crafted('descripcion-ruta-invalida.zip','description-traversal'),
+    descriptionDuplicateZip:crafted('descripcion-duplicada.zip','description-duplicate'),
+    descriptionHtmlZip:crafted('descripcion-html.zip','description-html'),
+    fullTraversalZip:crafted('deposito-ruta-invalida.zip','package-traversal')};
+}
+async function smtpProperties() {
+  if (process.env.E2E_MAIL !== '1') return [];
+  if (!smtp) {
+    smtp = net.createServer(socket => {
+      socket.setEncoding('utf8'); socket.write('220 localhost fixture SMTP\r\n');
+      let buffer='', data=false, message=[];
+      socket.on('data', chunk => {
+        buffer += chunk;
+        while (buffer.includes('\n')) {
+          const end=buffer.indexOf('\n'), line=buffer.slice(0,end).replace(/\r$/, '');
+          buffer=buffer.slice(end+1);
+          if (data) {
+            if (line==='.') { verificationMessages.push(message.join('\n')); message=[]; data=false; socket.write('250 accepted\r\n'); }
+            else message.push(line);
+          } else if (/^(EHLO|HELO)/i.test(line)) socket.write('250 localhost\r\n');
+          else if (/^MAIL FROM:/i.test(line)) socket.write(rejectSmtp ? '451 4.3.0 Temporary lookup error\r\n' : '250 sender accepted\r\n');
+          else if (/^RCPT TO:/i.test(line)) socket.write(/@example\.invalid>/i.test(line) ? '250 recipient accepted\r\n' : '550 only test recipients\r\n');
+          else if (/^DATA$/i.test(line)) { data=true; socket.write('354 send data\r\n'); }
+          else if (/^QUIT$/i.test(line)) socket.end('221 bye\r\n');
+          else if (/^RSET$/i.test(line)) { data=false;message=[];socket.write('250 reset\r\n'); }
+          else socket.write('502 unsupported\r\n');
+        }
+      });
+      socket.on('error', () => {});
+    });
+    await new Promise(resolve => smtp.listen(0,'127.0.0.1',resolve));
+  }
+  return ['spring.mail.host=127.0.0.1', `spring.mail.port=${smtp.address().port}`,
+    'spring.mail.username=', 'spring.mail.password=', 'repo.mail.from=fixture@example.invalid',
+    'spring.mail.properties.mail.smtp.auth=false',
+    'spring.mail.properties.mail.smtp.starttls.enable=false',
+    'spring.mail.properties.mail.smtp.starttls.required=false',
+    'spring.mail.properties.mail.smtp.ssl.enable=false',
+    'spring.mail.properties.mail.smtp.connectiontimeout=5000',
+    'spring.mail.properties.mail.smtp.timeout=5000'];
+}
+async function verificationFlow(base) {
+  if (!smtp) return;
+  const email='verification@example.invalid', name='verification-fixture';
+  const secret=crypto.randomBytes(16).toString('hex');
+  async function post(endpoint, body) {
+    const response=await fetch(base+'/api/v1/auth/'+endpoint, {
+      method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)
+    });
+    return {status:response.status, body:await response.json()};
+  }
+  const created=await post('register',{username:name,email,password:secret});
+  assert(created.status===201, 'El registro con SMTP local no completó.');
+  assert(verificationMessages.length===1, 'No llegó exactamente un mensaje al SMTP local.');
+  const code=verificationMessages[0].match(/es: ([0-9]{6})/)?.[1];
+  assert(code, 'El correo local no contiene código de seis dígitos.');
+  const blocked=await post('login',{username:name,password:secret});
+  assert(blocked.body.code==='EMAIL_NOT_VERIFIED' && !blocked.body.token, 'Una cuenta sin verificar obtuvo acceso.');
+  const verified=await post('verify',{email,code});
+  assert(verified.status===200, 'El código enviado por SMTP no verificó la cuenta.');
+  const logged=await post('login',{username:name,password:secret});
+  assert(logged.status===200 && logged.body.token && logged.body.user.role==='USER',
+    'La cuenta verificada no inició sesión como Usuario.');
+  verifiedAccount={...logged.body, password:secret};
+  const replay=await post('verify',{email,code});
+  assert(replay.status===400, 'El código ya consumido se pudo reutilizar.');
+  const recoveryEmail='mail-recovery@example.invalid', recoveryName='mail-recovery-fixture';
+  rejectSmtp=true;
+  try {
+    const failed=await post('register',{username:recoveryName,email:recoveryEmail,password:secret});
+    assert(failed.status===503 && failed.body.code==='VERIFICATION_MAIL_UNAVAILABLE',
+      'El fallo SMTP no conservó la respuesta recuperable de registro.');
+    assert(verificationMessages.length===1, 'El SMTP rechazado aceptó un mensaje.');
+    const retry=await post('register',{username:recoveryName,email:recoveryEmail,password:secret});
+    assert(retry.status===409, 'La cuenta creada con correo fallido desapareció o se duplicó.');
+    const denied=await post('login',{username:recoveryName,password:secret});
+    assert(denied.body.code==='EMAIL_NOT_VERIFIED' && !denied.body.token,
+      'La cuenta con correo fallido obtuvo acceso.');
+    const unavailable=await post('resend-verification',{email:recoveryEmail});
+    assert(unavailable.status===503 && !JSON.stringify(unavailable.body).includes('Temporary lookup error'),
+      'Reenvío fallido no devolvió mensaje seguro.');
+  } finally { rejectSmtp=false; }
+  const resent=await post('resend-verification',{email:recoveryEmail});
+  assert(resent.status===200 && verificationMessages.length===2, 'No se recuperó el reenvío SMTP.');
+  const recoveryCode=verificationMessages[1].match(/es: ([0-9]{6})/)?.[1];
+  assert(recoveryCode, 'No llegó código de recuperación.');
+  assert((await post('verify',{email:recoveryEmail,code:recoveryCode})).status===200,
+    'El código reenviado no verificó la cuenta conservada.');
+  const recovered=await post('login',{username:recoveryName,password:secret});
+  assert(recovered.status===200 && recovered.body.user.role==='USER', 'No se pudo entrar tras recuperar correo.');
+  process.stdout.write('Correo local OK: registro/verificación y recuperación tras rechazo SMTP451.\n');
+}
+async function databaseProperties() {
+  if (process.env.E2E_POSTGRES !== '1') return [
+    'spring.datasource.driver-class-name=org.h2.Driver',
+    'spring.datasource.url=jdbc:h2:mem:reduniv_wizard_smoke;DB_CLOSE_DELAY=-1;MODE=LEGACY;NON_KEYWORDS=VALUE',
+    'spring.datasource.username=sa', 'spring.datasource.password=sa'
+  ];
+  if (postgres) return ['spring.datasource.driver-class-name=org.postgresql.Driver',
+    `spring.datasource.url=jdbc:postgresql://127.0.0.1:${postgres.port}/${postgres.database}`,
+    'spring.datasource.username=e2e_admin', `spring.datasource.password=${postgres.secret}`];
+  assert(process.getuid() !== 0, 'Ejecute PostgreSQL efímero sin sudo.');
+  const bin = process.env.PG_BIN || '/usr/lib/postgresql/18/bin';
+  const data = path.join(temp, 'pgdata');
+  const secret = crypto.randomBytes(24).toString('hex');
+  const pwfile = path.join(temp, 'pg-password');
+  fs.writeFileSync(pwfile, secret + '\n', {mode:0o600});
+  const initialized = spawnSync(path.join(bin, 'initdb'),
+    ['-D', data, '-U', 'e2e_admin', '-A', 'scram-sha-256', '--pwfile', pwfile, '--no-instructions'], {encoding:'utf8'});
+  assert(initialized.status === 0, `initdb efímero falló: ${initialized.stderr}`);
+  const port = await freePort();
+  const started = spawnSync(path.join(bin, 'pg_ctl'), ['-D', data, '-l', path.join(temp, 'postgres.log'),
+    '-o', `-h 127.0.0.1 -p ${port} -k ${temp}`, '-w', 'start'], {encoding:'utf8'});
+  postgres = {bin, data, port, secret, database:'reduniv_e2e'};
+  assert(started.status === 0, `PostgreSQL efímero no inició: ${started.stderr}`);
+  const created = spawnSync(path.join(bin, 'createdb'), ['-h', '127.0.0.1', '-p', String(port), '-U', 'e2e_admin', 'reduniv_e2e'],
+    {encoding:'utf8', env:{...process.env, PGPASSWORD:secret}});
+  assert(created.status === 0, `No se pudo crear base efímera: ${created.stderr}`);
+  return ['spring.datasource.driver-class-name=org.postgresql.Driver',
+    `spring.datasource.url=jdbc:postgresql://127.0.0.1:${port}/reduniv_e2e`,
+    'spring.datasource.username=e2e_admin', `spring.datasource.password=${secret}`];
+}
+async function startApp(port, files) {
+  assert(fs.existsSync(jar), 'Falta build/libs/base-repo.jar; compile antes de iniciar el smoke test.');
+  const config = path.join(temp, 'application.properties');
+  fs.writeFileSync(config, [
+    `server.port=${port}`, 'server.address=127.0.0.1',
+    ...await databaseProperties(),
+    ...await smtpProperties(),
+    `spring.jpa.hibernate.ddl-auto=${postgres?.restored ? 'validate' : 'update'}`,
+    `repo.basepath=${pathToFileUrl(files.data)}`,
+    'repo.auth.enabled=true', 'management.endpoints.web.exposure.include=health,info,metrics',
+    'logging.level.edu.kit.datamanager.repo.security.ResourceOwnershipAuthorizationFilter=DEBUG',
+    `repo.auth.jwtSecret=${crypto.randomBytes(48).toString('hex')}`,
+    `repo.auth.bootstrap-admin-username=${username}`,
+    `repo.auth.bootstrap-admin-password=${password}`,
+    'repo.search.enabled=false', 'repo.messaging.enabled=false',
+    'spring.cloud.config.enabled=false', 'eureka.client.enabled=false',
+    'logging.level.edu.kit=INFO',
+  ].join('\n') + '\n', {mode:0o600});
+  const log = path.join(temp, 'application.log');
+  const output = fs.openSync(log, 'w', 0o600);
+  app = spawn(java, ['-jar', jar,
+    `--spring.config.location=file:${path.join(root, 'config/application-default.properties')},file:${config}`,
+    '--spring.profiles.active=default'], {cwd:root, stdio:['ignore', output, output]});
+  fs.closeSync(output);
+  const health = `http://127.0.0.1:${port}/actuator/health`;
+  for (let attempt = 0; attempt < 90; attempt++) {
+    if (app.exitCode !== null) throw new Error('El backend terminó durante el arranque.');
+    try {
+      const response = await fetch(health, {signal:AbortSignal.timeout(1500)});
+      if (response.ok && (await response.json()).status === 'UP') return;
+    } catch { /* The server has not bound the port yet. */ }
+    await sleep(1000);
+  }
+  throw new Error('El backend no respondió a /actuator/health en 90 segundos.');
+}
+function pathToFileUrl(directory) {
+  return require('node:url').pathToFileURL(directory + path.sep).href;
+}
+async function login(page, base) {
+  await page.goto(base + '/login.html', {waitUntil:'load'});
+  await page.type('input[name=username]', username);
+  await page.type('input[name=password]', password);
+  await page.click('#login-form button[type=submit]');
+  await page.waitForFunction(() => location.pathname.endsWith('/index.html'), {timeout:15000});
+}
+async function wizardNext(page,index){
+  await page.click('#wizard-next');
+  await page.waitForSelector(`.wizard-panel[data-step="${index}"]:not([hidden])`,{visible:true});
+}
+async function wizardPreviewAndConfirm(page,withRelation=false){
+  await wizardNext(page,5);
+  if(withRelation){
+    await page.$$eval('.wizard-panel[data-step="5"] button',buttons=>buttons.find(button=>button.textContent.includes('Añadir artículo')).click());
+    await page.select('[data-relation-field=kind]','SOFTWARE');await page.select('[data-relation-field=identifierType]','URL');
+    await page.type('[data-relation-field=identifier]','http://example.org/software');await page.click('#wizard-next');
+    assert(await page.$eval('.wizard-panel[data-step="5"]',panel=>!panel.hidden),'Aceptó URL no HTTPS.');
+    await page.$eval('[data-relation-field=identifier]',input=>input.value='https://example.org/software');await page.type('[data-relation-field=title]','Software de prueba');
+    await page.waitForFunction(()=>Object.keys(localStorage).some(key=>key.startsWith('reduniv-deposit-v1:')&&JSON.parse(localStorage.getItem(key)).relations?.some(item=>item.kind==='SOFTWARE'&&item.identifier==='https://example.org/software')));
+    await page.evaluate(axe.source);const accessibility=await page.evaluate(async()=>axe.run('#creation-relations',{runOnly:{type:'tag',values:['wcag2a','wcag2aa','wcag21aa','wcag22aa']}}));
+    assert(accessibility.violations.length===0,'Formulario de relaciones con infracciones axe: '+accessibility.violations.map(item=>item.id).join(','));
+  }
+  await wizardNext(page,6);
+  assert(await page.$eval('#wizard-quality',node=>node.textContent.includes('comprobaciones locales')),'Falta precomprobación explicada.');
+  await wizardNext(page,7);await page.waitForFunction(()=>!document.querySelector('#wizard-next').disabled);
+  await wizardNext(page,8);
+  assert(await page.$$eval('.wizard-progress li',items=>items.length===9),'El asistente no tiene nueve etapas.');
+  let writes=0;const observe=request=>{if(request.method()==='POST'&&new URL(request.url()).pathname==='/api/v1/dataresources/')writes++;};
+  page.on('request',observe);await page.click('#save-submit');
+  await page.waitForFunction(()=>document.querySelector('[name=reviewConfirmed]')===document.activeElement);
+  assert(writes===0,'Se creó un recurso sin confirmar la revisión final.');page.off('request',observe);
+  await page.click('[name=reviewConfirmed]');
+}
+async function deposit(page, base, files, mode) {
+  const title = `Depósito E2E ${mode} ${Date.now()}`;
+  await page.goto(base + '/create.html', {waitUntil:'load'});
+  await page.waitForSelector('.creator-given');
+  await page.type('input[name=title]', title);
+  await wizardNext(page,1);
+  await page.type('.creator-given', 'Ada');
+  await page.type('.creator-family', 'Ejemplo');
+  await page.type('input[name=institution]', 'RedUniv');
+  await wizardNext(page,2);
+  await page.type('textarea[name=methodology]', 'Metodología de prueba local.');
+  await page.type('textarea[name=productionDescription]','Producción científica declarada por sensores.');
+  await page.type('textarea[name=processingDescription]','Limpieza científica declarada de valores ausentes.');
+  await page.type('textarea[name=processingTools]','Python 3.12; script público v1.');
+  await page.type('textarea[name=summary]','Resumen estructurado de prueba.');
+  await page.type('input[name=geographicCoverage]','Cuba');
+  await page.evaluate(()=>{document.querySelector('[name=temporalStart]').value='2025-01-01';document.querySelector('[name=temporalEnd]').value='2025-12-31';});
+  await page.click('#metadata-translations > button');
+  await page.type('.translation-row input','en');
+  await page.type('.translation-row label:nth-of-type(2) input','Translated scientific title');
+  await page.type('.translation-row textarea','Structured translated summary.');
+  if(mode==='md') {
+    await page.evaluate(()=>document.querySelector('[name=temporalEnd]').value='2024-12-31');
+    await page.click('#wizard-next');
+    assert(await page.$eval('.wizard-panel[data-step="2"]',element=>!element.hidden),'El asistente aceptó un rango temporal invertido.');
+    await page.evaluate(()=>document.querySelector('[name=temporalEnd]').value='2025-12-31');
+  }
+  await wizardNext(page,3);
+  if (mode === 'package') {
+    await page.click('[name="uploadMode"][value="package"]');
+    await (await page.$('#package-file')).uploadFile(files.fullZip);
+  } else {
+    await (await page.$('#description-file')).uploadFile(mode === 'zip' ? files.zip : files.description);
+    await (await page.$('#dataset-files')).uploadFile(...(mode === 'zip' ? [files.csv1, files.csv2] : [files.csv1]));
+  }
+  await wizardNext(page,4);
+  await page.type('input[name=licenseId]', 'CC-BY-4.0');
+  await page.select('select[name=privacyClassification]','NONE');
+  await wizardPreviewAndConfirm(page,mode==='md');
+  await page.waitForFunction(() => !document.querySelector('#save-draft').disabled, {timeout:10000});
+  const preview = await page.$eval('#preview-content', element => element.textContent);
+  assert(preview.includes('Vista previa de cita (borrador)') && preview.includes('Cita provisional') && preview.includes(title), 'Asistente sin cita de borrador previa o sin título.');
+  assert(preview.includes(title) && preview.includes('Ada Ejemplo'), 'La vista previa no muestra los metadatos.');
+  if (mode === 'package') {
+    assert((await page.$eval('#save-submit', element => element.textContent)).includes('revisar antes de enviar'),
+      'El asistente promete enviar el ZIP sin mostrar su contenido real.');
+    await page.click('#save-submit');
+  } else await page.click('#save-draft');
+  await page.waitForFunction(() => location.pathname.endsWith('/resource.html'), {timeout:30000})
+    .catch(async () => { throw new Error(`No redirigió después de guardar: ${await page.$eval('#wizard-message', element => element.textContent)}; transferencias: ${await page.evaluate(() => document.querySelector('.transfer-list')?.textContent || 'monitor ausente')}`); });
+  await page.waitForFunction(() => document.querySelector('#resource-title')?.textContent !== 'Cargando…', {timeout:15000});
+  await page.waitForFunction(() => document.querySelector('#download-list')?.textContent.includes('datos-uno.csv'), {timeout:15000});
+  assert((await page.$eval('#resource-title', element => element.textContent)) === title,
+    'El borrador creado no muestra el título esperado.');
+  if(mode==='md'){
+    const related=await page.evaluate(async()=>fetch(`/api/v1/scientific/${new URLSearchParams(location.search).get('id')}/relations`,{headers:auth.headers()}).then(response=>response.json()));
+    assert(related.some(item=>item.kind==='SOFTWARE'&&item.identifier==='https://example.org/software'),'No persistió relación tipada de creación.');
+  }
+  const listing = await page.$eval('#download-list', element => element.textContent);
+  if (mode !== 'md') {
+    assert(listing.includes('datos-dos.csv'), 'Falta el segundo archivo del dataset.');
+    await page.waitForSelector('#markdown-rendered img');
+    await page.$eval('#markdown-rendered img',image=>image.scrollIntoView({block:'center'}));
+    await page.waitForFunction(() => document.querySelector('#markdown-rendered img')?.naturalWidth > 0,
+      {timeout:15000});
+    if (mode === 'package') await page.waitForFunction(() => document.querySelector('#markdown-rendered')?.textContent.includes('Paquete completo'),
+      {timeout:15000});
+  } else {
+    await page.waitForFunction(() => document.querySelector('#markdown-rendered')?.textContent.includes('Descripción de prueba'),
+      {timeout:15000});
+  }
+  const status = await page.evaluate(async () => {
+    const id = new URLSearchParams(location.search).get('id');
+    const token = localStorage.getItem('base-repo-token');
+    const response = await fetch(`/api/v1/scientific/${encodeURIComponent(id)}`,
+      {headers:{Authorization:`Bearer ${token}`}});
+    return response.ok ? (await response.json()).status : `HTTP ${response.status}`;
+  });
+  const structured=await page.evaluate(async()=>await (await fetch('/api/v1/scientific/'+new URLSearchParams(location.search).get('id'),{headers:auth.headers()})).json());
+  assert(structured.productionDescription==='Producción científica declarada por sensores.'&&structured.processingDescription==='Limpieza científica declarada de valores ausentes.'&&structured.processingTools==='Python 3.12; script público v1.','Procedencia científica no persistida.');
+  assert(structured.summary==='Resumen estructurado de prueba.' && structured.temporalStart==='2025-01-01' && structured.geographicCoverage==='Cuba' && structured.translations.en.title==='Translated scientific title','El depósito no persistió metadatos estructurados/traducciones.');
+  assert(status === 'DRAFT', `El depósito no quedó como borrador: ${status}`);
+  if (mode === 'md') {
+    await page.click('.download-file[data-path="datos-uno.csv"]');
+    await page.waitForFunction(() => document.querySelector('.transfer-list')?.textContent.includes('Descarga preparada'));
+    await page.click('.transfer-toggle');
+    assert(await page.$eval('#transfer-panel', element => !element.hidden), 'No se abrió el monitor de descargas.');
+    assert(await page.$eval('.transfer-item progress', element => element.value) === 100, 'La descarga no terminó en el monitor.');
+    await page.evaluate(require('../a11y/node_modules/axe-core').source);
+    const violations = await page.evaluate(async () => (await axe.run('#transfer-panel')).violations.map(item => item.id));
+    assert(violations.length === 0, `Accesibilidad del monitor: ${violations.join(', ')}`);
+    await page.click('.transfer-toggle');
+  }
+  if (mode === 'package') {
+    await page.waitForSelector('#submit-science:not([hidden])');
+    await page.click('#submit-science');
+    await page.waitForFunction(() => document.querySelector('#submit-preview-content')?.textContent.includes('Paquete completo'), {timeout:10000})
+      .catch(async () => {
+        const details = await page.evaluate(async () => {
+          const id = new URLSearchParams(location.search).get('id');
+          const response = await fetch(`/api/v1/scientific/${id}/quality`, {headers:{Authorization:`Bearer ${localStorage.getItem('base-repo-token')}`}});
+          return {status:response.status, body:await response.text()};
+        });
+        throw new Error(`Vista previa posterior a ZIP: ${await page.$eval('#submit-preview-content', element => element.textContent)}; calidad: ${JSON.stringify(details)}`);
+      });
+    assert((await page.$eval('#submit-preview-content', element => element.textContent)).includes('datos-dos.csv'),
+      'La vista previa previa al envío no muestra los archivos extraídos.');
+    await page.click('#submit-preview-modal [data-close-modal]');
+  }
+  return {title, id:new URLSearchParams(new URL(page.url()).search).get('id'), fileCount:mode === 'md' ? 1 : 2};
+}
+async function rejectPackage(page, base, id, archive, expected) {
+  const token = await page.evaluate(() => localStorage.getItem('base-repo-token'));
+  const form = new FormData();
+  form.append('file', new Blob([fs.readFileSync(archive)], {type:'application/zip'}), path.basename(archive));
+  const response = await fetch(`${base}/api/v1/dataresources/${encodeURIComponent(id)}/attachments?package=true&path=${encodeURIComponent(path.basename(archive))}`,
+    {method:'POST', headers:{Authorization:`Bearer ${token}`}, body:form});
+  const body = await response.text();
+  assert(response.status === 400 && body.includes(expected),
+    `El ZIP inválido no fue rechazado correctamente: HTTP ${response.status} ${body}`);
+}
+async function rejectDescription(page, base, id, archive, expected) {
+  const token = await page.evaluate(() => localStorage.getItem('base-repo-token'));
+  const form = new FormData();
+  form.append('file', new Blob([fs.readFileSync(archive)], {type:'application/zip'}), path.basename(archive));
+  const response = await fetch(`${base}/api/v1/dataresources/${encodeURIComponent(id)}/description`,
+    {method:'POST', headers:{Authorization:`Bearer ${token}`}, body:form});
+  const body = await response.text();
+  assert(response.status === 400 && body.includes(expected),
+    `El ZIP de descripción inválido no fue rechazado: HTTP ${response.status} ${body}`);
+}
+async function recoverInterruptedUpload(page, base, files) {
+  const title = `Depósito E2E interrumpido ${Date.now()}`;
+  await page.goto(base + '/create.html', {waitUntil:'load'});
+  await page.waitForSelector('.creator-given');
+  await page.type('input[name=title]', title);
+  await wizardNext(page,1);
+  await page.type('.creator-given', 'Eva');
+  await page.type('input[name=institution]', 'RedUniv');
+  await wizardNext(page,2);
+  await page.type('textarea[name=methodology]', 'Prueba de recuperación.');
+  await wizardNext(page,3);
+  await (await page.$('#description-file')).uploadFile(files.description);
+  await (await page.$('#dataset-files')).uploadFile(files.csv1);
+  await wizardNext(page,4);await page.type('input[name=licenseId]','CC-BY-4.0');await page.select('select[name=privacyClassification]','NONE');
+  await wizardPreviewAndConfirm(page);
+  await page.waitForFunction(() => !document.querySelector('#save-submit').disabled);
+  const interrupt = request => request.url().includes('/attachments?') ? request.abort('failed') : request.continue();
+  await page.setRequestInterception(true);
+  page.on('request', interrupt);
+  try {
+    await page.click('#save-submit');
+    await page.waitForSelector('#wizard-message a[href^="resource.html?id="]', {timeout:30000});
+    assert(new URL(page.url()).pathname.endsWith('/create.html'), 'El depósito se envió pese al fallo de subida.');
+    assert((await page.$eval('.transfer-list', element => element.textContent)).includes('Error de red'),
+      'El monitor no informó la subida interrumpida.');
+  } finally {
+    page.off('request', interrupt);
+    await page.setRequestInterception(false);
+  }
+  const link = await page.$eval('#wizard-message a', anchor => anchor.href);
+  const id = new URL(link).searchParams.get('id');
+  const before = await page.evaluate(async resourceId => {
+    const response = await fetch(`/api/v1/scientific/${resourceId}`, {headers:{Authorization:`Bearer ${localStorage.getItem('base-repo-token')}`}});
+    return (await response.json()).status;
+  }, id);
+  assert(before === 'DRAFT', `El fallo de subida cambió el estado a ${before}.`);
+  await page.goto(link, {waitUntil:'load'});
+  await page.waitForFunction(() => document.querySelector('#markdown-rendered')?.textContent.includes('Descripción de prueba'));
+  assert(!(await page.$eval('#download-list', element => element.textContent)).includes('datos-uno.csv'),
+    'La prueba de interrupción no abortó la subida de datos.');
+  await page.click('[data-open-modal="files-modal"]');
+  await (await page.$('#resource-files')).uploadFile(files.csv1);
+  await page.click('#files-form button.primary');
+  await page.waitForFunction(() => document.querySelector('#download-list')?.textContent.includes('datos-uno.csv'));
+  await page.click('#submit-science');
+  await page.waitForFunction(() => document.querySelector('#submit-preview-content')?.textContent.includes('Descripción de prueba'));
+  assert(await page.$eval('#confirm-submit-science', element => !element.disabled),
+    'El depósito recuperado sigue bloqueado para revisión.');
+  await page.click('#confirm-submit-science');
+  await page.waitForFunction(() => document.querySelector('#publication-status')?.textContent.includes('En revisión'));
+  return title;
+}
+async function deriveNewVersion(page, base, files, previous) {
+  const token = await page.evaluate(() => localStorage.getItem('base-repo-token'));
+  async function request(method, endpoint, body) {
+    const response = await fetch(base + endpoint, {method,
+      headers:{Authorization:`Bearer ${token}`, ...(body ? {'Content-Type':'application/json'} : {})},
+      ...(body ? {body:JSON.stringify(body)} : {})});
+    const text = await response.text();
+    assert(response.ok, `${method} ${endpoint} falló: HTTP ${response.status} ${text}`);
+    return text ? JSON.parse(text) : null;
+  }
+  const versionDoi = `10.99999/reduniv-local-${Date.now()}`;
+  await request('PUT', `/api/v1/scientific/${previous.id}`, {
+    versionLabel:'1.0', versionDoi, conceptualDoi:`10.99999/reduniv-concept-local-${Date.now()}`,
+    licenseId:'CC-BY-4.0', institution:'RedUniv', methodology:'Metodología de prueba local.', accessLevel:'OPEN'
+  });
+  await request('POST', `/api/v1/scientific/${previous.id}/submit`);
+  // Synthetic DOI approval is confined to the throwaway local database.
+  await request('POST', `/api/v1/scientific/${previous.id}/publish`, {doiRegisteredExternally:true});
+  await page.goto(`${base}/resource.html?id=${encodeURIComponent(previous.id)}`, {waitUntil:'load'});
+  await page.waitForSelector('#new-version:not([hidden])');
+  await page.click('#new-version');
+  await page.waitForFunction(id => location.pathname.endsWith('/create.html') && new URLSearchParams(location.search).get('basedOn') === id,
+    {}, previous.id);
+  await page.waitForFunction(title => document.querySelector('input[name=title]')?.value === title,
+    {}, previous.title);
+  await page.$eval('input[name=versionLabel]', input => {input.value='2.0';input.dispatchEvent(new Event('input',{bubbles:true}));});
+  await wizardNext(page,1);await page.type('input[name=institution]','RedUniv');await wizardNext(page,2);
+  await page.type('textarea[name=methodology]', 'Segunda versión de prueba.');
+  await wizardNext(page,3);
+  await (await page.$('#description-file')).uploadFile(files.description);
+  await (await page.$('#dataset-files')).uploadFile(files.csv2);
+  await wizardNext(page,4);await page.type('input[name=licenseId]','CC-BY-4.0');await page.select('select[name=privacyClassification]','NONE');
+  await wizardPreviewAndConfirm(page);
+  await page.waitForFunction(() => !document.querySelector('#save-draft').disabled);
+  assert((await page.$eval('#preview-content', node => node.textContent)).includes(`Nueva versión de ${previous.id}`),
+    'La vista previa no muestra el vínculo con la versión anterior.');
+  await page.click('#save-draft');
+  await page.waitForFunction(() => location.pathname.endsWith('/resource.html'), {timeout:30000});
+  const id = new URLSearchParams(new URL(page.url()).search).get('id');
+  const next = await request('GET', `/api/v1/scientific/${id}`);
+  assert(next.status === 'DRAFT' && next.previousResourceId === previous.id && next.versionLabel === '2.0',
+    `La segunda versión no quedó vinculada como borrador: ${JSON.stringify({status:next.status, previousResourceId:next.previousResourceId, versionLabel:next.versionLabel})}`);
+  await page.waitForFunction(() => document.querySelector('#download-list')?.textContent.includes('datos-dos.csv'));
+  const listing = await page.$eval('#download-list', node => node.textContent);
+  assert(!listing.includes('datos-uno.csv'), 'La versión nueva heredó archivos sin confirmación del autor.');
+  const original = await request('GET', `/api/v1/scientific/${previous.id}`);
+  assert(original.status === 'PUBLISHED', 'Crear la nueva versión alteró la publicación anterior.');
+  assert(next.conceptualDoi === original.conceptualDoi,
+    'La nueva versión no conservó el DOI conceptual del conjunto.');
+  return id;
+}
+async function verifyTypeTransitionPolicy(page,base) {
+  const token=await page.evaluate(()=>localStorage.getItem('base-repo-token'));
+  const headers={Authorization:`Bearer ${token}`,'Content-Type':'application/json'};
+  const response=await fetch(base+'/api/v1/dataresources/',{method:'POST',headers,body:JSON.stringify({
+    titles:[{value:'Synthetic type transition policy'}],creators:[{givenName:'Local regression'}],
+    resourceType:{value:'IMAGE',typeGeneral:'IMAGE'},publisher:'Synthetic local test',publicationYear:'2026'
+  })});
+  const createBody=await response.text();
+  assert(response.status===201,'Could not create synthetic type policy resource: '+response.status+' '+createBody);
+  const resource=JSON.parse(createBody);const url=base+'/api/v1/dataresources/'+resource.id;
+  async function snapshot(){const result=await fetch(url,{headers});assert(result.ok,'Type resource read failed.');return {resource:await result.json(),etag:result.headers.get('etag')};}
+  async function change(operations,expected){const before=await snapshot();const result=await fetch(url,{method:'PATCH',headers:{...headers,'Content-Type':'application/json-patch+json','If-Match':before.etag},body:JSON.stringify(operations)});assert(result.status===expected,'Type patch returned '+result.status+' instead of '+expected+': '+await result.text());return snapshot();}
+  try {
+    const initial=await snapshot();
+    const denied=await change([{op:'replace',path:'/resourceType/typeGeneral',value:'TEXT'}],400);
+    assert(denied.resource.resourceType.typeGeneral==='IMAGE'&&denied.etag===initial.etag,'Rejected patch mutated type/version.');
+    const other=await change([{op:'replace',path:'/resourceType/typeGeneral',value:'OTHER'},{op:'replace',path:'/resourceType/value',value:'OTHER'}],204);
+    assert(other.resource.resourceType.typeGeneral==='OTHER','Valid OTHER transition was not persisted.');
+    await change([{op:'replace',path:'/resourceType/typeGeneral',value:'IMAGE'}],400);
+    const current=await snapshot();
+    const put=await fetch(url,{method:'PUT',headers:{...headers,'If-Match':current.etag},body:JSON.stringify({...current.resource,resourceType:{...current.resource.resourceType,typeGeneral:'IMAGE'}})});
+    assert(put.status===400,'PUT bypassed terminal OTHER type.');
+    const final=await snapshot();assert(final.resource.resourceType.typeGeneral==='OTHER'&&final.etag===current.etag,'Rejected PUT mutated type/version.');
+  } finally {
+    const current=await snapshot();const removed=await fetch(url,{method:'DELETE',headers:{...headers,'If-Match':current.etag}});
+    assert(removed.status===204,'Synthetic type resource cleanup failed.');
+  }
+  process.stdout.write('Type transition policy OK: rejected PATCH unchanged/ETag, IMAGE to OTHER accepted, OTHER terminal for PATCH and PUT, temporary resource removed.'+String.fromCharCode(10));
+}
+
+async function verifyUploadLeaseLoss(page,base,dataset) {
+  if(!postgres)return;
+  assert(/^[a-zA-Z0-9-]+$/.test(dataset.id),'Synthetic ID must be SQL-safe.');
+  const token=await page.evaluate(()=>localStorage.getItem('base-repo-token'));
+  const headers={Authorization:`Bearer ${token}`,Accept:'application/octet-stream'};
+  const args=['-X','-At','-v','ON_ERROR_STOP=1','-h','127.0.0.1','-p',String(postgres.port),'-U','e2e_admin','-d',postgres.database];
+  const env={...process.env,PGPASSWORD:postgres.secret};
+  function sql(query){const result=spawnSync(path.join(postgres.bin,'psql'),[...args,'-c',query],{env,encoding:'utf8'});assert(result.status===0,'Lease loss SQL failed: '+result.stderr);return result.stdout.trim();}
+  const key=crypto.createHash('sha256').update('reduniv:resource-mutation:'+dataset.id).digest().readBigInt64BE(0).toString();
+  const initial=await fetch(base+'/api/v1/dataresources/'+dataset.id+'/data/description.md',{headers});assert(initial.ok,'Missing original description.');
+  const original=Buffer.from(await initial.arrayBuffer());
+  for(const kind of ['attachments','description']) {
+    const boundary='reduniv-session-loss-'+Date.now();
+    const filename=kind==='description'?'description.md':'lease-loss.csv';
+    const crlf=String.fromCharCode(13,10);
+    const prefix=Buffer.from([`--${boundary}`,`Content-Disposition: form-data; name="file"; filename="${filename}"`,
+      'Content-Type: text/plain','','Blocked upload must never become visible',''].join(crlf));
+    const tail=Buffer.from(['end',`--${boundary}--`,''].join(crlf));
+    let request,parsedResolve,parsedReject;
+    const parsing=new Promise((resolve,reject)=>{parsedResolve=resolve;parsedReject=reject;});
+    const uploaded=new Promise((resolve,reject)=>{
+      request=require('node:http').request(base+'/api/v1/dataresources/'+dataset.id+'/'+kind+(kind==='attachments'?'?path=lease-loss.csv':''),{
+        method:'POST',headers:{Authorization:`Bearer ${token}`,Expect:'100-continue','Content-Type':'multipart/form-data; boundary='+boundary,'Content-Length':prefix.length+tail.length}
+      },response=>{const chunks=[];response.on('data',part=>chunks.push(part));response.on('end',()=>resolve({status:response.statusCode,body:Buffer.concat(chunks).toString()}));});
+      request.on('continue',parsedResolve);request.on('error',error=>{parsedReject(error);reject(error);});request.flushHeaders();
+    });
+    let timer;
+    try {
+      // Configured continueResponseTiming=onRead acknowledges servlet body reads;
+      // this proves the pre-body ownership filter already accepted DRAFT.
+      await Promise.race([parsing,new Promise((_,reject)=>{timer=setTimeout(()=>reject(new Error('Multipart parser did not acknowledge 100-continue.')),10000);})]);clearTimeout(timer);
+      request.write(prefix);
+      let backend='';
+      for(let i=0;i<40;i++) {
+        backend=sql(`SELECT pid FROM pg_locks WHERE locktype='advisory' AND granted AND objsubid=1 AND classid=(((${key})::bigint >> 32) & 4294967295)::oid AND objid=(((${key})::bigint) & 4294967295)::oid`);
+        if(/^[0-9]+$/.test(backend))break;
+        await new Promise(resolve=>setTimeout(resolve,100));
+      }
+      assert(/^[0-9]+$/.test(backend),'Expected exactly one lease session during multipart parse; matching sessions='+backend.split(String.fromCharCode(10)).filter(Boolean).length+'.');
+      assert(sql(`SELECT pg_terminate_backend(${backend})`)==='t','Could not terminate dedicated lease session.');
+      // Simulate a committed state transition from an independent writer after
+      // the request passed its initial guard but before the body is complete.
+      sql(`UPDATE scientific_records SET status='IN_REVIEW' WHERE resource_id='${dataset.id}'`);
+      request.end(tail);const result=await uploaded;
+      assert(result.status===409 && result.body.includes('no es un borrador editable'),'Late '+kind+' upload bypassed primary state recheck: '+result.status+' '+result.body);
+    } finally {
+      clearTimeout(timer);request.destroy();await uploaded.catch(()=>{});
+      sql(`UPDATE scientific_records SET status='DRAFT' WHERE resource_id='${dataset.id}'`);
+    }
+    const absent=await fetch(base+'/api/v1/dataresources/'+dataset.id+'/data/lease-loss.csv',{headers});assert(absent.status===404,'Failed upload registered content.');
+    const current=await fetch(base+'/api/v1/dataresources/'+dataset.id+'/data/description.md',{headers});assert(current.ok&&Buffer.from(await current.arrayBuffer()).equals(original),'Failed upload changed original description bytes.');
+    const recovery=await fetch(base+'/api/v1/scientific/'+dataset.id+'/funding',{method:'PUT',headers:{Authorization:`Bearer ${token}`,'Content-Type':'application/json'},body:'[]'});
+    assert(recovery.ok,'Session-loss recovery retained a poisoned lease connection.');
+  }
+  process.stdout.write('Upload session-loss fence OK: onRead/CRLF 100-continue proves parsing after initial guard; terminated lease cannot append CSV or replace Markdown after state transition; recovery succeeds.\n');
+}
+
+async function verifyTwoJvmFence(page,base,dataset,other) {
+  if(!postgres)return;
+  const port=await freePort();const secondBase=`http://127.0.0.1:${port}`;
+  const output=fs.openSync(path.join(temp,'second-jvm.log'),'w',0o600);
+  const second=spawn(java,['-Xms64m','-Xmx384m','-jar',jar,
+    `--spring.config.location=file:${path.join(root,'config/application-default.properties')},file:${path.join(temp,'application.properties')}`,
+    '--spring.profiles.active=default',`--server.port=${port}`,'--spring.jpa.hibernate.ddl-auto=validate'],
+    {cwd:root,stdio:['ignore',output,output]});fs.closeSync(output);
+  let holder;
+  const token=await page.evaluate(()=>localStorage.getItem('base-repo-token'));
+  const headers={Authorization:`Bearer ${token}`,'Content-Type':'application/json'};
+  const args=['-X','-At','-v','ON_ERROR_STOP=1','-h','127.0.0.1','-p',String(postgres.port),'-U','e2e_admin','-d',postgres.database];
+  const env={...process.env,PGPASSWORD:postgres.secret};
+  try {
+    let ready=false;
+    for(let attempt=0;attempt<90;attempt++) {
+      assert(second.exitCode===null,'Second JVM exited before healthcheck.');
+      try {const response=await fetch(secondBase+'/actuator/health',{signal:AbortSignal.timeout(1500)});if(response.ok){ready=true;break;}}catch{}
+      await sleep(1000);
+    }
+    assert(ready,'Second JVM never became healthy.');
+    // No real accounts: unknown identity exercises shared counters without password work.
+    const rateIdentity='rate-two-jvm-'+crypto.randomBytes(8).toString('hex');
+    const attempt=host=>fetch(host+'/api/v1/auth/login',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({username:rateIdentity,password:'invalid-fixture'})});
+    assert((await attempt(base)).status===401,'Initial rate bucket not available.');
+    const burst=await Promise.all(Array.from({length:19},(_,i)=>attempt(i%2?base:secondBase)));
+    const allowed=burst.filter(r=>r.status===401).length;
+    assert(allowed===9&&burst.every(r=>[401,429].includes(r.status)),'Concurrent two-JVM rate limit exceeded ten or failed unexpectedly: '+burst.map(r=>r.status));
+    for(const host of [base,secondBase]){const limited=await attempt(host);assert(limited.status===429&&Number(limited.headers.get('retry-after'))>0,'Rate limit not shared across JVMs.');}
+    process.stdout.write('Rate limit PostgreSQL/two JVMs OK: twenty concurrent attempts, exactly ten allowed, both instances return429/Retry-After.\n');
+    const rootResponse=await fetch(base+'/api/v1/dataresources/'+dataset.id,{headers});
+    const resource=await rootResponse.json();const etag=rootResponse.headers.get('etag');
+    holder=spawn(path.join(postgres.bin,'psql'),args,{env,stdio:['pipe','pipe','pipe']});
+    await new Promise((resolve,reject)=>{
+      let output='';const timer=setTimeout(()=>reject(new Error('Two-JVM SQL holder timeout.')),10000);
+      holder.stdout.on('data',chunk=>{output+=chunk;if(output.includes('TWO_JVM_HELD')){clearTimeout(timer);resolve();}});
+      holder.once('error',reject);
+      holder.stdin.write(`BEGIN;\nSELECT id FROM data_resource WHERE id='${dataset.id}' FOR UPDATE;\nSELECT 'TWO_JVM_HELD';\n`);
+    });
+    const first=fetch(base+'/api/v1/dataresources/'+dataset.id,{method:'PUT',headers:{...headers,'If-Match':etag},body:JSON.stringify(resource)});
+    const key=crypto.createHash('sha256').update('reduniv:resource-mutation:'+dataset.id).digest().readBigInt64BE(0);
+    const unsigned=BigInt.asUintN(64,key);const classid=(unsigned>>32n).toString();const objid=(unsigned&0xffffffffn).toString();
+    let active=false;
+    for(let attempt=0;attempt<20;attempt++){
+      const query=spawnSync(path.join(postgres.bin,'psql'),[...args,'-c',`SELECT count(*) FROM pg_locks WHERE locktype='advisory' AND classid=${classid} AND objid=${objid} AND granted`],{env,encoding:'utf8'});
+      if(query.stdout.trim()==='1'){active=true;break;}await sleep(30);
+    }
+    assert(active,'First JVM did not hold a real request lease.');
+    const blocked=await fetch(secondBase+'/api/v1/scientific/'+dataset.id+'/funding',{method:'PUT',headers,body:'[]'});
+    assert(blocked.status===409&&blocked.headers.get('retry-after')==='1','Second JVM bypassed the first JVM request lease.');
+    assert((await fetch(secondBase+'/api/v1/scientific/'+other.id+'/funding',{method:'PUT',headers,body:'[]'})).ok,'Second JVM blocked unrelated dataset.');
+    assert((await first).status===409,'First JVM bypassed the primary SQL lock.');
+    holder.stdin.end('ROLLBACK;\n\\q\n');await new Promise(resolve=>holder.once('exit',resolve));holder=null;
+    const retry=await fetch(secondBase+'/api/v1/dataresources/'+dataset.id,{method:'PATCH',headers:{...headers,'Content-Type':'application/json-patch+json','If-Match':etag},body:JSON.stringify([{op:'replace',path:'/publisher',value:resource.publisher}])});
+    assert(retry.status===204,'Second JVM did not recover after lease/row release: '+retry.status+' '+await retry.text());
+    process.stdout.write('Two JVMs OK: shared PostgreSQL lease, primary legacy PUT fence, unrelated writer and PATCH recovery.\n');
+  } finally {
+    if(holder){holder.stdin.end('ROLLBACK;\n\\q\n');holder.kill('SIGTERM');}
+    second.kill('SIGTERM');await new Promise(resolve=>{if(second.exitCode!==null)return resolve();second.once('exit',resolve);setTimeout(()=>{second.kill('SIGKILL');resolve();},10000).unref();});
+  }
+}
+
+async function verifyPrimaryRowFence(page,base,dataset,other) {
+  if(!postgres)return;
+  assert(/^[a-zA-Z0-9-]+$/.test(dataset.id),'Synthetic resource ID must be SQL-safe.');
+  const token=await page.evaluate(()=>localStorage.getItem('base-repo-token'));
+  const headers={Authorization:`Bearer ${token}`,'Content-Type':'application/json'};
+  const args=['-X','-At','-v','ON_ERROR_STOP=1','-h','127.0.0.1','-p',String(postgres.port),'-U','e2e_admin','-d',postgres.database];
+  const holder=spawn(path.join(postgres.bin,'psql'),args,{env:{...process.env,PGPASSWORD:postgres.secret},stdio:['pipe','pipe','pipe']});
+  const before=await (await fetch(base+'/api/v1/scientific/'+dataset.id,{headers})).json();
+  try {
+    await new Promise((resolve,reject)=>{
+      let output='',errors='';const timer=setTimeout(()=>reject(new Error('Primary row lock unavailable: '+errors)),10000);
+      holder.stderr.on('data',chunk=>{errors+=chunk;});
+      holder.stdout.on('data',chunk=>{output+=chunk;if(output.includes('PRIMARY_ROW_HELD')){clearTimeout(timer);resolve();}});
+      holder.once('error',error=>{clearTimeout(timer);reject(error);});
+      holder.once('exit',code=>{if(!output.includes('PRIMARY_ROW_HELD')){clearTimeout(timer);reject(new Error('Primary row holder exited: '+code+' '+errors));}});
+      holder.stdin.write(`BEGIN;\nSELECT id FROM data_resource WHERE id='${dataset.id}' FOR UPDATE;\nSELECT 'PRIMARY_ROW_HELD';\n`);
+    });
+    // No advisory lease is held by the independent SQL session: only the primary
+    // transaction fence can stop this request after the normal request gate passes.
+    for(const [method,suffix,body] of [
+      ['PUT','',{}],['PUT','/funding',[]],['PUT','/relations',[]],['PUT','/creators',[]],
+      ['PUT','/privacy',{}],['POST','/submit',{}],['POST','/publish',{doiRegisteredExternally:true}],
+      ['POST','/return-to-draft',{}],['POST','/withdraw',{reason:'Synthetic blocked request'}]
+    ]) {
+      const started=Date.now();
+      const response=await fetch(base+'/api/v1/scientific/'+dataset.id+suffix,{method,headers,body:JSON.stringify(body)});
+      const result=await response.text();
+      assert(response.status===409 && result.includes('operación en curso'),'Primary row fence did not reject '+suffix+': '+response.status+' '+result);
+      assert(Date.now()-started>=1500 && Date.now()-started<10000,'Primary lock timeout was not bounded near 2 seconds: '+suffix);
+    }
+    assert((await fetch(base+'/api/v1/scientific/'+other.id+'/funding',{method:'PUT',headers,body:'[]'})).ok,'Primary row fence blocked a different dataset.');
+    assert(JSON.stringify(await (await fetch(base+'/api/v1/scientific/'+dataset.id,{headers})).json())===JSON.stringify(before),'Blocked primary transaction changed the record.');
+  } finally {
+    holder.stdin.end('ROLLBACK;\n\\q\n');
+    await new Promise(resolve=>{if(holder.exitCode!==null)return resolve();holder.once('exit',resolve);setTimeout(()=>{holder.kill('SIGTERM');resolve();},5000).unref();});
+  }
+  assert((await fetch(base+'/api/v1/scientific/'+dataset.id+'/funding',{method:'PUT',headers,body:'[]'})).ok,'Primary row fence failed to recover after rollback.');
+  process.stdout.write('Primary row fence OK: independent SQL transaction, nine writes bounded without advisory lock, unrelated dataset and recovery.\n');
+}
+
+async function verifyMutationCoordination(page,base,dataset,other) {
+  if(!postgres)return;
+  const token=await page.evaluate(()=>localStorage.getItem('base-repo-token'));
+  const headers={Authorization:`Bearer ${token}`,'Content-Type':'application/json'};
+  const key=crypto.createHash('sha256').update('reduniv:resource-mutation:'+dataset.id).digest().readBigInt64BE(0).toString();
+  const args=['-X','-At','-v','ON_ERROR_STOP=1','-h','127.0.0.1','-p',String(postgres.port),'-U','e2e_admin','-d',postgres.database];
+  const env={...process.env,PGPASSWORD:postgres.secret};
+  const before=await (await fetch(base+'/api/v1/scientific/'+dataset.id,{headers})).json();
+  const holder=spawn(path.join(postgres.bin,'psql'),args,{env,stdio:['pipe','pipe','pipe']});
+  try {
+    await new Promise((resolve,reject)=>{
+      let output='';const timer=setTimeout(()=>reject(new Error('No se adquirió lease PostgreSQL externo.')),10000);
+      holder.stdout.on('data',chunk=>{output+=chunk;if(output.includes('MUTATION_LOCK_HELD')){clearTimeout(timer);resolve();}});
+      holder.once('error',error=>{clearTimeout(timer);reject(error);});
+      holder.once('exit',code=>{if(!output.includes('MUTATION_LOCK_HELD')){clearTimeout(timer);reject(new Error('psql externo terminó antes del lease: '+code));}});
+      holder.stdin.write(`SELECT pg_advisory_lock(${key});
+SELECT 'MUTATION_LOCK_HELD';
+`);
+    });
+    const encoded='%'+dataset.id.charCodeAt(0).toString(16)+dataset.id.slice(1);
+    const attempts=[
+      ['PUT','/api/v1/scientific/'+dataset.id,{}],
+      ['PUT','/api/v1/scientific/'+dataset.id+'/funding',[]],
+      ['PUT','/api/v1/scientific/'+dataset.id+'/creators',[]],
+      ['PUT','/api/v1/scientific/'+dataset.id+'/privacy',{}],
+      ['POST','/api/v1/scientific/'+dataset.id+'/submit',{}],
+      ['POST','/api/v1/scientific/'+dataset.id+'/publish',{doiRegisteredExternally:true}],
+      ['POST','/api/v1/dataresources/'+dataset.id+'/attachments?path=blocked.csv',{}],
+      ['DELETE','/api/v1/dataresources/'+encoded,{}],
+      ['POST','/%61pi/v1/scientific/'+dataset.id+'/submit',{}]
+    ];
+    for(const [method,url,body]of attempts) {
+      const response=await fetch(base+url,{method,headers,body:JSON.stringify(body)});
+      assert(response.status===409,'Escritura no coordinada: '+method+' '+url+' -> '+response.status);
+      const text=await response.text();assert(text.includes('operación en curso'),'Conflicto no provino del coordinador: '+text);
+      assert(response.headers.get('retry-after')==='1','Falta instrucción de reintento.');
+    }
+    const after=await (await fetch(base+'/api/v1/scientific/'+dataset.id,{headers})).json();
+    assert(JSON.stringify(after)===JSON.stringify(before),'Intentos bloqueados modificaron ficha.');
+    assert((await fetch(base+'/api/v1/scientific/'+other.id+'/funding',{method:'PUT',headers,body:'[]'})).ok,'Lease de un dataset bloquea otro dataset.');
+  } finally {
+    holder.stdin.end(`SELECT pg_advisory_unlock(${key});
+\\q
+`);
+    await new Promise(resolve=>{if(holder.exitCode!==null)return resolve();holder.once('exit',resolve);setTimeout(()=>{holder.kill('SIGTERM');resolve();},5000).unref();});
+  }
+  assert((await fetch(base+'/api/v1/scientific/'+dataset.id+'/funding',{method:'PUT',headers,body:'[]'})).ok,'No se recuperó escritura tras liberar lease externo.');
+
+  // Hold a real multipart request open after headers/body prefix. DispatcherServlet
+  // waits for the remaining file while the mutation gate holds the resource lease.
+  const http=require('node:http'),boundary='reduniv-mutation-'+Date.now();
+  const prefix=Buffer.from(`--${boundary}\r\nContent-Disposition: form-data; name="file"; filename="mutation-race.csv"\r\nContent-Type: text/csv\r\n\r\na,b\n`);
+  const tail=Buffer.from(`1,2\n\r\n--${boundary}--\r\n`);
+  let request;
+  const uploaded=new Promise((resolve,reject)=>{
+    request=http.request(base+'/api/v1/dataresources/'+dataset.id+'/attachments?path=mutation-race.csv',{
+      method:'POST',headers:{Authorization:`Bearer ${token}`,'Content-Type':'multipart/form-data; boundary='+boundary,'Content-Length':prefix.length+tail.length}
+    },response=>{const chunks=[];response.on('data',part=>chunks.push(part));response.on('end',()=>resolve({status:response.statusCode,body:Buffer.concat(chunks).toString()}));});
+    request.on('error',reject);request.write(prefix);
+  });
+  try {
+    let held=false;
+    for(let i=0;i<40;i++) {
+      await new Promise(resolve=>setTimeout(resolve,100));
+      const probe=spawnSync(path.join(postgres.bin,'psql'),[...args,'-c',`SELECT pg_try_advisory_lock(${key})`],{env,encoding:'utf8'});
+      assert(probe.status===0,'No se pudo comprobar mutex durante subida.');
+      if(probe.stdout.trim()==='f'){held=true;break;}
+    }
+    assert(held,'La subida real no tomó lease antes de consumir el multipart.');
+    const submitted=await fetch(base+'/api/v1/scientific/'+dataset.id+'/submit',{method:'POST',headers,body:'{}'});
+    assert(submitted.status===409 && (await submitted.text()).includes('operación en curso'),'El envío compitió con la subida pendiente.');
+    request.end(tail);const result=await uploaded;assert(result.status===204,'Subida coordinada falló: '+result.status+' '+result.body);
+    assert((await (await fetch(base+'/api/v1/scientific/'+dataset.id,{headers})).json()).status==='DRAFT','Subida concurrente alteró estado editorial.');
+    assert((await fetch(base+'/api/v1/scientific/'+dataset.id+'/funding',{method:'PUT',headers,body:'[]'})).ok,'Lease quedó retenido tras completar subida.');
+  } finally {request.destroy();await uploaded.catch(()=>{});}
+  process.stdout.write('Coordinación OK: sesión PostgreSQL independiente, nueve mutaciones bloqueadas, rutas codificadas, datasets independientes y subida real excluye envío.\n');
+}
+
+async function publicVersionHistory(base,published,nextId,token) {
+  const headers={Authorization:`Bearer ${token}`,'Content-Type':'application/json'};
+  assert((await fetch(base+'/api/v1/public/resources/'+nextId+'/versions')).status===404,'Historial expone borrador.');
+  const before=await (await fetch(base+'/api/v1/public/resources/'+published.id+'/versions')).json();assert(before.total===1&&!JSON.stringify(before).includes(nextId),'Familia pública expone sucesora en borrador.');
+  const next=await (await fetch(base+'/api/v1/scientific/'+nextId,{headers})).json();
+  const contentUrl=base+'/api/v1/dataresources/'+nextId+'/archive';
+  async function ownedArchive() {
+    const response=await fetch(contentUrl,{headers});assert(response.ok,'Archivo editorial del autor rechazado.');
+    const buffer=Buffer.from(await response.arrayBuffer());const archivePath=path.join(temp,'editorial-version.zip');fs.writeFileSync(archivePath,buffer);
+    const check=spawnSync('python3',['-c',"import sys,zipfile; z=zipfile.ZipFile(sys.argv[1]); assert z.testzip() is None; assert 'description.md' in z.namelist(); assert 'datos-dos.csv' in z.namelist()",archivePath],{encoding:'utf8'});
+    assert(check.status===0,'ZIP editorial inválido o incompleto: '+check.stderr);
+  }
+  await ownedArchive();
+  if(verifiedAccount)assert((await fetch(base+'/api/v1/dataresources/'+nextId,{headers:{Authorization:`Bearer ${verifiedAccount.token}`}})).status===404,'Ruta legacy expone metadatos de borrador ajeno.');
+  assert(!(await fetch(contentUrl)).ok,'Ruta legacy expone archivo de borrador anónimamente.');
+  if(verifiedAccount)assert((await fetch(contentUrl,{headers:{Authorization:`Bearer ${verifiedAccount.token}`}})).status===404,'Ruta legacy expone borrador a usuario ajeno.');
+
+  assert((await fetch(base+'/api/v1/scientific/'+nextId,{method:'PUT',headers,body:JSON.stringify({...next,versionDoi:`10.99999/version-history-${Date.now()}`})})).ok,'No se pudo preparar sucesora sintética.');
+  assert((await fetch(base+'/api/v1/scientific/'+nextId+'/submit',{method:'POST',headers})).ok,'No se pudo enviar sucesora sintética.');
+  assert((await fetch(base+'/api/v1/scientific/'+nextId+'/publish',{method:'POST',headers,body:'{"doiRegisteredExternally":true}'})).ok,'No se pudo publicar sucesora sintética.');
+  const encodedId='%'+nextId.charCodeAt(0).toString(16)+nextId.slice(1);
+  for(const url of ['/api/v1/dataresources/'+encodedId,'/%61pi/v1/dataresources/'+nextId]) {
+    const denied=await fetch(base+url,{method:'DELETE',headers});
+    assert(denied.status===409 && (await denied.text()).includes('no es un borrador editable'),'URL codificada permitió eliminar publicación o no aplicó guard de estado.');
+  }
+  let history=await (await fetch(base+'/api/v1/public/resources/'+published.id+'/versions?size=1')).json();assert(history.latestPublishedId===nextId&&history.newerPublicationAvailable,'No informa publicación más reciente en la familia.');assert(history.total===2&&history.pages===2&&history.items.length===1&&history.items[0].id===nextId,'Historial paginado no incluye nueva versión.');
+  const beforeWithdrawalContext=await browser.createBrowserContext();try{const visitor=await beforeWithdrawalContext.newPage();await visitor.goto(base+'/datasets/'+published.id,{waitUntil:'load'});await visitor.waitForSelector('#family-version-warning a');assert(await visitor.$eval('#family-version-warning a',n=>n.href).then(href=>href.endsWith('/datasets/'+nextId)),'Aviso no apunta a última publicación de familia.');await visitor.waitForSelector('#versions-list button');await visitor.click('#versions-list button');await visitor.waitForSelector('.metadata-difference');assert(await visitor.$eval('.metadata-differences',n=>n.textContent.includes('2.0')),'Comparación pública no muestra cambio de versión.');assert(!await visitor.$eval('.metadata-differences',n=>n.textContent.includes('reviewNote')),'Comparación expone auditoría privada.');}finally{await beforeWithdrawalContext.close();}
+  assert((await fetch(base+'/api/v1/scientific/'+nextId+'/withdraw',{method:'POST',headers,body:JSON.stringify({reason:'Retirada sintética para prueba de historial'})})).ok,'No se pudo retirar sucesora sintética.');
+  assert(!(await fetch(contentUrl)).ok,'ACL legacy expone archivos retirados anónimamente.');
+  if(verifiedAccount)assert((await fetch(contentUrl,{headers:{Authorization:`Bearer ${verifiedAccount.token}`}})).status===404,'ACL legacy expone retirado a usuario ajeno.');
+  await ownedArchive();
+  if(verifiedAccount)assert((await fetch(base+'/api/v1/dataresources/'+nextId,{headers:{Authorization:`Bearer ${verifiedAccount.token}`}})).status===404,'Ruta legacy expone metadatos completos de versión retirada.');
+  history=await (await fetch(base+'/api/v1/public/resources/'+published.id+'/versions')).json();assert(history.items.some(v=>v.id===nextId&&v.status==='WITHDRAWN')&&history.items.some(v=>v.id===published.id&&v.current),'Retirada desapareció de familia pública.');
+  const context=await browser.createBrowserContext();try{const visitor=await context.newPage();await visitor.goto(base+'/datasets/'+published.id,{waitUntil:'load'});await visitor.waitForFunction(()=>document.querySelectorAll('#versions-list li').length===2);assert(await visitor.$eval('#versions-list',n=>n.textContent.includes('Retirada (ficha permanente)')),'Ficha no muestra versión retirada.');assert(await visitor.$eval('#versions-list [aria-current=page]',n=>n.href.endsWith('/datasets/'+new URL(location.href).pathname.split('/').pop())),'Ficha no identifica versión exacta.');}finally{await context.close();}
+  process.stdout.write('Versiones OK: borradores ocultos, publicación, familia paginada y retirada retenida en ficha pública.\n');
+}
+async function usageAndAssessment(page,base,resource){
+  const token=await page.evaluate(()=>localStorage.getItem('base-repo-token'));
+  const headers={Authorization:'Bearer '+token,'Content-Type':'application/json'};
+  const usageUrl=base+'/api/v1/public/usage?resourceId='+resource.id;
+  const externalResponse=await fetch(base+'/api/v1/public/resources/'+resource.id+'/usage-configuration');assert(externalResponse.ok,'Public tracker configuration missing');const external=await externalResponse.json();assert(external.enabled===false&&external.consentRequired===true&&external.certified===false&&!external.repositoryId&&!external.doi,'External tracking enabled without production approval');
+  const before=await (await fetch(usageUrl)).json();
+  assert(before.schema==='reduniv.local-usage.v1'&&before.collectionEnabled&&!before.counterCertified,'Usage report must be enabled and uncertified');
+  const agent={'User-Agent':'Mozilla/5.0 RedUniv Acceptance Human'};
+  const detail=base+'/api/v1/public/resources/'+resource.id;
+  for(let i=0;i<2;i++){const response=await fetch(detail,{headers:agent});assert(response.ok,'Public view failed');await response.arrayBuffer();}
+  const file=detail+'/file?path='+encodeURIComponent('datos-uno.csv');
+  const download=await fetch(file,{headers:agent});assert(download.ok,'Usage download failed');await download.arrayBuffer();
+  await fetch(detail,{method:'HEAD',headers:agent});
+  await fetch(detail,{headers:{'User-Agent':'crawler'}});
+  const inline=await fetch(file+'&inline=true',{headers:agent});await inline.arrayBuffer();
+  let after;
+  for(let n=0;n<30;n++){after=await(await fetch(usageUrl)).json();if(after.views===before.views+1&&after.downloads===before.downloads+1)break;await sleep(100);}
+  assert(after.views===before.views+1&&after.downloads===before.downloads+1&&after.rows.length===0,'Deduplication or exclusions failed');
+  const anonymousUsage=await fetch(base+'/api/v1/scientific/operations/usage');assert([401,403].includes(anonymousUsage.status),'Editorial usage exposed anonymously, status '+anonymousUsage.status);
+  const editorial=await(await fetch(base+'/api/v1/scientific/operations/usage',{headers})).json();assert(editorial.rows.length>0,'Editorial detail missing');
+  await page.goto(base+'/self-assessment.html',{waitUntil:'load'});
+  await page.waitForFunction(()=>document.querySelectorAll('#assessment-list article').length===16);
+  await page.click('#assessment-list article button');
+  await page.type('[name=responsible]','Editorial team');await page.type('[name=statement]','Internal mission evidence');
+  await page.type('[name=evidence]','https://example.org/mission');await page.select('[name=state]','READY_FOR_REVIEW');
+  await page.select('[data-ui-locale]','en');
+  assert(await page.$eval('[name=statement]',n=>n.value)==='Internal mission evidence','Locale change lost modal input');
+  const saved=observeResponse(page,r=>r.url().endsWith('/self-assessment/R01')&&r.request().method()==='PUT');
+  await page.click('#assessment-form [type=submit]');assert((await saved).ok(),'Self-assessment save failed');
+  await page.waitForFunction(()=>!document.querySelector('#assessment-modal').open&&document.querySelector('#assessment-list').textContent.includes('Internal mission evidence'));
+  const report=await(await fetch(base+'/api/v1/scientific/operations/self-assessment',{headers})).json();
+  assert(report.items.length===16&&report.certified===false&&report.items[0].state==='READY_FOR_REVIEW','Dossier not persisted correctly');
+  assert((await fetch(base+'/api/v1/scientific/operations/self-assessment/R01',{method:'PUT',headers,body:JSON.stringify({...report.items[0],revision:null})})).status===409,'Stale evidence overwrote dossier');
+  const anonymousDossier=await fetch(base+'/api/v1/scientific/operations/self-assessment');assert([401,403].includes(anonymousDossier.status),'Private dossier exposed, status '+anonymousDossier.status);
+  if(verifiedAccount){const userHeaders={Authorization:'Bearer '+verifiedAccount.token,'Content-Type':'application/json'};assert((await fetch(base+'/api/v1/scientific/operations/self-assessment',{headers:userHeaders})).status===403,'Normal user read internal dossier');assert((await fetch(base+'/api/v1/scientific/operations/self-assessment/R01',{method:'PUT',headers:userHeaders,body:JSON.stringify(report.items[0])})).status===403,'Normal user edited internal dossier');}
+  await page.select('[data-ui-locale]','es');
+  process.stdout.write('Usage and internal self-assessment OK: real PostgreSQL, private access, deduplication, modal and locale preservation.\n');
+}
+
+async function publicDownloads(base, resource) {
+  const metricsResponse=await fetch(base+'/api/v1/public/metrics');
+  assert(metricsResponse.ok,'Métricas públicas no accesibles.');
+  assert(metricsResponse.headers.get('cache-control').includes('no-store'),'Inventario almacenado en caché.');
+  const metrics=await metricsResponse.json();
+  assert(metrics.publishedVersions>=1 && metrics.definitions.publishedVersions && metrics.scope.includes('COUNTER'), 'Inventario sin datos/definiciones.');
+  const help = await fetch(base+'/help.html');
+  assert(help.status===200,'La guía de ayuda debe ser pública, sin sesión.');
+  const helpHtml = await help.text();
+  assert(helpHtml.includes('Citar una versión') && helpHtml.includes('pendiente de aprobación/publicación'),
+    'Guía incompleta o política institucional presentada como aprobada.');
+  const context = await browser.createBrowserContext();
+  try {
+    const page = await context.newPage();
+    const errors = [];
+    page.on('pageerror', error => errors.push(error.message));
+    await page.evaluateOnNewDocument(() => {
+      window.showSaveFilePicker = async options => {
+        const directory = await navigator.storage.getDirectory();
+        window.directDownloadHandle = await directory.getFileHandle(options.suggestedName, {create:true});
+        return window.directDownloadHandle;
+      };
+    });
+    await page.goto(`${base}/public-resource.html?id=${encodeURIComponent(resource.id)}`, {waitUntil:'load'});
+    await page.waitForSelector('#files .file-row a');
+    assert(await page.evaluate(() => localStorage.getItem('base-repo-token')) === null,
+      'La prueba pública heredó una sesión autenticada.');
+    assert(await page.evaluate(()=>document.querySelector('#landing').textContent.includes('Translated scientific title') && document.querySelector('#identity').textContent.includes('Cuba') && document.querySelector('#identity').textContent.includes('Resumen estructurado') && document.querySelector('#scientific-provenance').textContent.includes('Limpieza científica declarada')), 'Ficha pública sin resumen/cobertura/traducción.');
+    assert(await page.evaluate(()=>document.querySelector('#identity').textContent.includes('Última actualización')), 'Ficha sin última actualización.');
+    await page.evaluate(()=>{
+      const original=URL.createObjectURL;window.originalCreateObjectURL=original;
+      URL.createObjectURL=blob=>{blob.text().then(value=>window.exportedPublicMetadata=JSON.parse(value));return original(blob);};
+      Object.defineProperty(navigator,'clipboard',{configurable:true,value:{writeText:async value=>{window.copiedPermanentLink=value;}}});
+    });
+    await page.click('#share-resource');
+    assert(await page.evaluate(id=>window.copiedPermanentLink.endsWith('/datasets/'+id),resource.id),'Enlace compartido no permanente.');
+    await page.click('#export-metadata');
+    await page.waitForFunction(()=>window.exportedPublicMetadata);
+    const exported=await page.evaluate(()=>window.exportedPublicMetadata);
+    assert(exported.schema==='reduniv.public-metadata.v1' && exported.metadata.id===resource.id && exported.metadata.lastUpdate,'Exportación general incompleta.');
+    await page.evaluate(()=>{URL.createObjectURL=window.originalCreateObjectURL;});
+    const fileResponse = observeResponse(page, response => response.url().includes('/file?path='));
+    await page.click('#files .file-row a');
+    const file = await fileResponse;
+    assert(file.ok(), 'Descarga pública individual rechazada.');
+    assert((await file.text()).includes('nombre,valor'), 'Contenido público individual incorrecto.');
+    await page.waitForFunction(() => document.querySelector('.transfer-list')?.textContent.includes('Descarga preparada'));
+    const archiveResponse = observeResponse(page, response => response.url().endsWith('/archive'));
+    await page.click('#download-archive');
+    const archive = await archiveResponse;
+    assert(archive.ok(), 'ZIP público rechazado.');
+    const zip = path.join(temp, 'public-download.zip');
+    fs.writeFileSync(zip, await archive.buffer());
+    const inspected = spawnSync('python3', ['-c',
+      "import sys,zipfile; z=zipfile.ZipFile(sys.argv[1]); assert z.testzip() is None; names=z.namelist(); assert any(n.endswith('description.md') for n in names), names; assert any(n.endswith('datos-uno.csv') for n in names), names",
+      zip], {encoding:'utf8'});
+    assert(inspected.status === 0, `ZIP público incompleto: ${inspected.stderr}`);
+    await page.waitForFunction(() => [...document.querySelectorAll('.transfer-item span')].filter(node => node.textContent === 'Descarga preparada').length === 2);
+    await page.select('#format', 'bibtex');
+    const citationResponse = observeResponse(page, response => response.url().includes('/citation?format=bibtex'));
+    await page.click('#export');
+    const citation = await citationResponse;
+    assert(citation.ok() && (await citation.text()).includes('@'), 'Exportación pública BibTeX inválida.');
+    await page.waitForFunction(() => [...document.querySelectorAll('.transfer-item span')].filter(node => node.textContent === 'Descarga preparada').length === 3);
+    await page.click('.transfer-toggle');
+    await page.click('#transfer-disk-mode');
+    await page.click('.transfer-close');
+    await page.click('#files .file-row a');
+    await page.waitForFunction(()=>document.querySelector('.transfer-item span')?.textContent==='Archivo guardado' && document.querySelector('#status')?.textContent==='Archivo guardado.', {timeout:5000}).catch(async error => {throw new Error(error.message+': '+await page.evaluate(()=>JSON.stringify({status:document.querySelector('#status')?.textContent,monitor:document.querySelector('.transfer-list')?.textContent,disk:document.querySelector('#transfer-disk-mode')?.checked})));});
+    const savedCsv = await page.evaluate(async () => (await directDownloadHandle.getFile()).text());
+    assert(savedCsv === await file.text(),'El guardado directo no conserva los bytes del CSV público.');
+    assert(await page.evaluate(()=>localStorage.getItem('base-repo-token'))===null,
+      'El guardado directo público requirió sesión.');
+    assert(errors.length === 0, `Errores JavaScript públicos: ${errors.join('; ')}`);
+    process.stdout.write('Descargas públicas anónimas OK: CSV, ZIP con descripción, BibTeX y CSV directo a disco (OPFS).\n');
+  } finally { await context.close(); }
+}
+async function metadataProfilesFlow(page,base,draft) {
+  const token=await page.evaluate(()=>localStorage.getItem('base-repo-token'));
+  const headers={Authorization:`Bearer ${token}`,'Content-Type':'application/json'},root=base+'/api/v1/scientific/metadata-profiles';
+  if(verifiedAccount){assert((await fetch(root+'/administration',{headers:{Authorization:`Bearer ${verifiedAccount.token}`}})).status===403,'Usuario gestionó perfiles admin.');assert((await fetch(base+'/api/v1/scientific/'+draft.id+'/metadata-profile',{method:'PUT',headers:{Authorization:`Bearer ${verifiedAccount.token}`,'Content-Type':'application/json'},body:'{}'})).status===403,'Usuario aplicó perfil a dataset ajeno.');}
+  await page.goto(base+'/metadata-profiles-admin.html',{waitUntil:'load'});await page.waitForFunction(()=>document.querySelector('#profiles-admin-status')?.textContent==='Perfiles consultados.');
+  await page.click('#new-profile');await page.waitForSelector('#profile-edit-modal[open]',{visible:true});
+  for(const [name,value]of Object.entries({id:'test-profile',name:'Perfil tabular de prueba',description:'Reglas sintéticas; no es aprobación institucional.',licenseId:'CC-BY-4.0',language:'es',discipline:'Física',note:'Propuesta de prueba aislada.'}))await page.type(`#profile-edit-form [name="${name}"]`,value);
+  await page.click('#profile-required-options input[value="processingTools"]');
+  const proposed=observeResponse(page,r=>r.request().method()==='PUT'&&r.url().endsWith('/administration/test-profile'));await page.click('#profile-edit-form [type=submit]');assert((await proposed).ok(),'No propuso perfil.');
+  assert(!(await (await fetch(root,{headers})).json()).some(profile=>profile.id==='test-profile'),'Perfil no aprobado apareció como disponible.');
+  await page.waitForFunction(()=>[...document.querySelectorAll('#profiles-admin-list button')].some(button=>button.textContent==='Revisar y aprobar'));
+  await page.evaluate(()=>[...document.querySelectorAll('#profiles-admin-list button')].find(button=>button.textContent==='Revisar y aprobar').click());await page.waitForSelector('#profile-confirm-modal[open]',{visible:true});
+  const approved=observeResponse(page,r=>r.request().method()==='POST'&&r.url().endsWith('/test-profile/approve'));await page.click('#profile-confirm-form [type=submit]');assert((await approved).ok(),'No aprobó perfil.');
+  const available=await (await fetch(root,{headers})).json(),profile=available.find(value=>value.id==='test-profile');assert(profile?.requiredFields.includes('processingTools'),'Perfil no conserva reglas aprobadas.');
+  const inReview=await (await fetch(base+'/api/v1/scientific/'+draft.id,{headers})).json();assert(inReview.status==='IN_REVIEW','El fixture de perfil no estaba en revisión.');
+  assert((await fetch(base+'/api/v1/scientific/'+draft.id+'/metadata-profile',{method:'PUT',headers,body:JSON.stringify({profileId:profile.id,profileRevision:profile.revision,resourceRevision:inReview.revision})})).status===409,'Permitió cambiar perfil en revisión.');
+  assert((await fetch(base+'/api/v1/scientific/'+draft.id+'/return-to-draft',{method:'POST',headers})).ok,'No devolvió el fixture a borrador para editar su perfil.');
+  await page.goto(base+'/resource.html?id='+draft.id,{waitUntil:'load'});await page.waitForSelector('#main-content[aria-busy=false]');await page.waitForSelector('#change-metadata-profile:not([hidden])',{visible:true});await page.waitForFunction(()=>[...document.querySelector('#dataset-profile-select').options].some(option=>option.value==='test-profile'));
+  await page.select('#dataset-profile-select','test-profile');await page.click('#change-metadata-profile');await page.waitForSelector('#dataset-profile-confirm[open]',{visible:true});
+  const applied=observeResponse(page,r=>r.request().method()==='PUT'&&r.url().endsWith('/metadata-profile'));await page.click('#dataset-profile-confirm footer .primary');assert((await applied).ok(),'No aplicó perfil al borrador propio.');
+  await page.waitForFunction(()=>document.querySelector('#metadata-profile-current')?.textContent.includes('Perfil tabular de prueba'));
+  const science=await (await fetch(base+'/api/v1/scientific/'+draft.id,{headers})).json();assert(science.metadataProfileRevision===profile.revision&&science.metadataProfileRequiredFields.includes('processingTools'),'No congeló reglas por dataset.');
+  const changed=await fetch(base+'/api/v1/scientific/'+draft.id,{method:'PUT',headers,body:JSON.stringify({...science,processingTools:''})});assert(changed.ok,'No pudo vaciar campo científico de prueba.');
+  const report=await (await fetch(base+'/api/v1/scientific/'+draft.id+'/quality',{headers})).json();assert(report.blockers.some(blocker=>blocker.includes('Herramientas')),'Checklist no detectó requisito de perfil.');assert((await fetch(base+'/api/v1/scientific/'+draft.id+'/submit',{method:'POST',headers})).status===400,'Perfil permitió enviar con requisito faltante.');
+  assert((await fetch(base+'/api/v1/scientific/'+draft.id,{method:'PUT',headers,body:JSON.stringify({...science,processingTools:'Python 3.12; script público v1.'})})).ok,'No restauró herramientas declaradas.');
+  const admin=(await (await fetch(root+'/administration',{headers})).json()).find(value=>value.id==='test-profile');
+  assert((await fetch(root+'/administration/test-profile/active',{method:'POST',headers,body:JSON.stringify({revision:admin.revision,active:false})})).ok,'No desactivó perfil.');
+  const retained=await (await fetch(base+'/api/v1/scientific/'+draft.id,{headers})).json();assert(retained.metadataProfileRequiredFields.includes('processingTools'),'Desactivar perfil alteró reglas del dataset.');assert(!(await (await fetch(root,{headers})).json()).some(value=>value.id==='test-profile'),'Perfil inactivo sigue disponible.');
+  const inactive=(await (await fetch(root+'/administration',{headers})).json()).find(value=>value.id==='test-profile');assert((await fetch(root+'/administration/test-profile/active',{method:'POST',headers,body:JSON.stringify({revision:inactive.revision,active:true})})).ok,'No reactivó perfil.');
+  await page.goto(base+'/create.html',{waitUntil:'load'});await page.waitForFunction(()=>[...document.querySelector('#dataset-profile-select').options].some(option=>option.value==='test-profile'));
+  await page.evaluate(()=>{document.querySelector('[data-step="0"]').hidden=false;document.querySelector('[name=licenseId]').value='Licencia del autor';});
+  await page.select('#dataset-profile-select','test-profile');await page.click('#apply-dataset-profile');await page.waitForSelector('#dataset-profile-confirm[open]',{visible:true});await page.click('#dataset-profile-confirm footer .primary');
+  assert(await page.$eval('[name=licenseId]',input=>input.value)==='Licencia del autor','Perfil reemplazó licencia declarada.');assert(await page.$eval('[name=language]',input=>input.value)==='es','Perfil no completó idioma vacío.');
+  assert(await page.evaluate(()=>!metadataProfileWidget.validate()),'Asistente no detecta herramienta faltante del perfil.');
+  await page.evaluate(()=>{localStorage.removeItem(`reduniv-deposit-v1:${auth.user().username}:new`);});
+  process.stdout.write('Perfiles OK: administración/aprobación, widget explícito, autoría, reglas congeladas, calidad, desactivación y valores de autor preservados.\n');
+}
+async function vocabularyFlow(page,base) {
+  const token=await page.evaluate(()=>localStorage.getItem('base-repo-token'));
+  const headers={Authorization:`Bearer ${token}`,'Content-Type':'application/json'};
+  const endpoint=base+'/api/v1/scientific/vocabularies/administration';
+  if(verifiedAccount)assert((await fetch(endpoint,{headers:{Authorization:`Bearer ${verifiedAccount.token}`}})).status===403,'Usuario no administrador gestionó vocabularios.');
+  assert((await fetch(endpoint)).status===401,'Anónimo gestionó vocabularios.');
+  const before=await (await fetch(base+'/api/v1/scientific/vocabularies',{headers})).json();
+  const administratorList=await fetch(endpoint,{headers});assert(administratorList.ok,'Administrador no pudo consultar vocabularios.');assert((await administratorList.json()).length===2,'Registro no incluye ambas listas.');
+  await page.goto(base+'/vocabulary-admin.html',{waitUntil:'load'});
+  try{await page.waitForFunction(()=>document.querySelectorAll('#vocabulary-lists section').length===2);}catch(error){throw Error('No cargó UI vocabularios: '+await page.evaluate(()=>location.pathname+' · '+(document.querySelector('#vocabulary-status')?.textContent||'sin panel'))+' · '+error.message);}
+  await page.click('#vocabulary-lists section:first-child button');
+  await page.waitForSelector('#vocabulary-modal[open] textarea',{visible:true});
+  await page.$eval('#vocabulary-form [name=values]',(input,values)=>input.value=values.join('\n'),[...before.licenses,'Institutional-test']);
+  await page.type('#vocabulary-form [name=note]','Propuesta administrativa sintética; no es aprobación institucional.');
+  const saved=observeResponse(page,r=>r.request().method()==='PUT'&&r.url().endsWith('/administration/LICENSE'));
+  await page.click('#vocabulary-form [type=submit]');assert((await saved).ok(),'No guardó propuesta de vocabulario.');
+  const pending=await (await fetch(endpoint,{headers})).json();const entry=pending.find(value=>value.kind==='LICENSE');
+  assert(entry.proposedValues.includes('Institutional-test'),'No conservó propuesta.');
+  const unchanged=await (await fetch(base+'/api/v1/scientific/vocabularies',{headers})).json();assert(JSON.stringify(unchanged.licenses)===JSON.stringify(before.licenses),'Propuesta pendiente reemplazó lista activa.');
+  assert((await fetch(endpoint+'/LICENSE/approve',{method:'POST',headers,body:JSON.stringify({revision:entry.revision+1})})).status===409,'Aprobó revisión obsoleta.');
+  await page.waitForFunction(()=>[...document.querySelectorAll('#vocabulary-lists button')].some(button=>button.textContent==='Revisar y aprobar'));
+  await page.evaluate(()=>[...document.querySelectorAll('#vocabulary-lists button')].find(button=>button.textContent==='Revisar y aprobar').click());
+  await page.waitForSelector('#vocabulary-approval-modal[open]',{visible:true});
+  const approved=observeResponse(page,r=>r.request().method()==='POST'&&r.url().endsWith('/LICENSE/approve'));
+  await page.click('#vocabulary-approval-form [type=submit]');assert((await approved).ok(),'No aprobó propuesta.');
+  const after=await (await fetch(base+'/api/v1/scientific/vocabularies',{headers})).json();assert(after.licenses.includes('Institutional-test'),'Aprobación no activó vocabulario.');
+  process.stdout.write('Vocabularios OK: permisos, modales, propuesta no activa, conflicto de revisión y aprobación explícita.\n');
+}
+async function privacyFlow(page,base,draft) {
+  const token=await page.evaluate(()=>localStorage.getItem('base-repo-token'));
+  const headers={Authorization:`Bearer ${token}`,'Content-Type':'application/json'};
+  await page.goto(base+'/resource.html?id='+draft.id,{waitUntil:'load'});
+  await page.waitForSelector('#main-content[aria-busy=false]');
+  await page.waitForSelector('#edit-privacy:not([hidden])',{visible:true});
+  await page.click('#edit-privacy');await page.waitForSelector('#privacy-modal[open] #privacy-form [type=submit]',{visible:true});await page.select('#privacy-form select','PERSONAL');
+  await page.type('#privacy-form textarea','PRIVATE_ASSESSMENT_SENTINEL protection measures');
+  const declaration=observeResponse(page, r=>r.request().method()==='PUT'&&r.url().endsWith('/privacy'));
+  await page.click('#privacy-form [type=submit]');assert((await declaration).ok(),'Modal de declaración rechazado.');
+  const policy=await (await fetch(base+'/api/v1/scientific/privacy-policy',{headers})).json();assert(typeof policy.required==='boolean','Política de privacidad inválida.');
+  const science=await (await fetch(base+'/api/v1/scientific/'+draft.id,{headers})).json();
+  const restricted=await fetch(base+'/api/v1/scientific/'+draft.id,{method:'PUT',headers,body:JSON.stringify({...science,accessLevel:'RESTRICTED',versionDoi:`10.99999/privacy-${Date.now()}`})});
+  assert(restricted.ok,'No se pudo restringir el depósito de prueba.');
+  assert((await fetch(base+'/api/v1/scientific/'+draft.id+'/submit',{method:'POST',headers})).ok,'No se pudo enviar evaluación a curación.');
+  assert((await fetch(base+'/api/v1/scientific/'+draft.id+'/publish',{method:'POST',headers,body:'{"doiRegisteredExternally":true}'})).status===409,'Publicó datos sensibles sin aprobación.');
+  if(verifiedAccount)assert((await fetch(base+'/api/v1/scientific/'+draft.id+'/privacy',{headers:{Authorization:`Bearer ${verifiedAccount.token}`}})).status===404,'Usuario ajeno leyó notas privadas.');
+  await page.goto(base+'/reviews.html',{waitUntil:'load'});
+  await page.waitForFunction(id=>[...document.querySelectorAll('.review-card')].some(card=>card.querySelector('h2').textContent===id),{},draft.id);
+  await page.evaluate(id=>{const card=[...document.querySelectorAll('.review-card')].find(c=>c.querySelector('h2').textContent===id);[...card.querySelectorAll('button')].find(b=>b.textContent==='Revisar metadatos y archivos').click();},draft.id);
+  await page.waitForFunction(()=>[...document.querySelectorAll('button')].some(b=>b.textContent==='Revisar privacidad'));
+  await page.evaluate(()=>[...document.querySelectorAll('button')].find(b=>b.textContent==='Revisar privacidad').click());
+  await page.select('#privacy-review-form select','APPROVED');await page.type('#privacy-review-form textarea','PRIVATE_REVIEW_SENTINEL checked access.');
+  const approval=observeResponse(page, r=>r.request().method()==='POST'&&r.url().endsWith('/privacy/review'));
+  await page.click('#privacy-review-form [type=submit]');assert((await approval).ok(),'Modal de revisión de privacidad rechazado.');
+  assert((await fetch(base+'/api/v1/scientific/'+draft.id+'/publish',{method:'POST',headers,body:'{"doiRegisteredExternally":true}'})).ok,'No publicó después de aprobación privada y restricción.');
+  const publicMetadata=await fetch(base+'/api/v1/public/resources/'+draft.id);assert(publicMetadata.ok,'Metadatos restringidos no consultables.');
+  const body=await publicMetadata.text();assert(!body.includes('PRIVATE_ASSESSMENT_SENTINEL')&&!body.includes('PRIVATE_REVIEW_SENTINEL')&&!body.includes('assessmentNote'),'Notas privadas filtradas en ficha pública.');
+  assert(!(await fetch(base+'/api/v1/public/resources/'+draft.id+'/file?path=datos-uno.csv')).ok,'Archivo sensible descargable anónimamente.');
+  process.stdout.write('Privacidad OK: declaración/revisión modal, aprobación obligatoria, notas privadas y archivos restringidos.\n');
+}
+async function collectionsFlow(page, base, published, draft) {
+  const token=await page.evaluate(()=>localStorage.getItem('base-repo-token'));
+  const headers={Authorization:`Bearer ${token}`,'Content-Type':'application/json'};
+  await page.goto(base+'/collections.html?manage=true',{waitUntil:'load'});
+  await page.waitForFunction(()=>!document.querySelector('#new-collection').hidden);
+  await page.click('#new-collection');
+  await page.type('#collection-form [name=title]','Colección E2E '+Date.now());
+  await page.type('#collection-form [name=description]','Agrupación real local');
+  const creation=observeResponse(page, r=>r.request().method()==='POST'&&r.url().endsWith('/api/v1/collections'));
+  await page.click('#collection-form [type=submit]');
+  const response=await creation;assert(response.status()===201,'No se pudo crear colección por formulario.');
+  const collection=await response.json();
+  assert((await fetch(base+'/api/v1/public/collections/'+collection.id)).status===404,'Colección privada expuesta.');
+  await page.goto(base+'/collections.html?manage=true&id='+collection.id,{waitUntil:'load'});
+  await page.waitForFunction(()=>!document.querySelector('#member-form').hidden);
+  await page.type('#member-form input',published.id);
+  const membership=observeResponse(page, r=>r.request().method()==='PUT'&&r.url().includes('/datasets/'));
+  await page.click('#member-form button');
+  assert((await membership).status()===204,'No se pudo agregar miembro por formulario.');
+  assert((await fetch(base+'/api/v1/collections/'+collection.id+'/datasets/'+draft.id,{method:'PUT',headers})).status===204,'No se pudo agregar borrador.');
+  // Repeated membership must remain a single reference, not a copy.
+  assert((await fetch(base+'/api/v1/collections/'+collection.id+'/datasets/'+published.id,{method:'PUT',headers})).status===204,'Membresía no idempotente.');
+  await page.reload({waitUntil:'load'});
+  await page.waitForFunction(()=>!document.querySelector('#edit-collection').disabled);
+  await page.click('#edit-collection');await page.click('#collection-form [name=published]');
+  const updated=observeResponse(page, r=>r.request().method()==='PUT'&&r.url().endsWith('/api/v1/collections/'+collection.id));
+  await page.click('#collection-form [type=submit]');assert((await updated).ok(),'No se pudo publicar colección.');
+  const stale=await fetch(base+'/api/v1/collections/'+collection.id,{method:'PUT',headers,body:JSON.stringify({...collection,title:'Edición obsoleta'})});
+  assert(stale.status===409,'Edición obsoleta no fue rechazada.');
+  const publicPage=await (await fetch(base+'/api/v1/public/collections/'+collection.id+'?size=1')).json();
+  assert(publicPage.total===1&&publicPage.items[0].id===published.id,'Borrador expuesto o miembro duplicado en colección pública.');
+  const anonymous=await browser.createBrowserContext();
+  try {
+    const visitor=await anonymous.newPage();
+    await visitor.goto(base+'/collections.html?id='+collection.id,{waitUntil:'load'});
+    await visitor.waitForSelector('#collection-results .resource-card');
+    assert((await visitor.$$eval('#collection-results .resource-card',items=>items.length))===1,'Vista pública muestra miembros privados.');
+    assert(await visitor.$eval('#management',el=>el.hidden),'Visitante recibe controles de gestión.');
+  } finally {await anonymous.close();}
+  assert((await fetch(base+'/api/v1/collections/'+collection.id+'/datasets/'+published.id,{method:'DELETE',headers})).status===204,'No se pudo quitar miembro.');
+  assert((await fetch(base+'/api/v1/public/resources/'+published.id)).ok,'Quitar miembro eliminó dataset.');
+  await page.reload({waitUntil:'load'});await page.waitForFunction(()=>!document.querySelector('#delete-collection').disabled);
+  await page.click('#delete-collection');await page.waitForSelector('#collection-confirm[open]');
+  const removal=observeResponse(page, r=>r.request().method()==='DELETE'&&r.url().endsWith('/api/v1/collections/'+collection.id));
+  const returnToList=page.waitForNavigation({waitUntil:'load'});returnToList.catch(()=>{});
+  await page.click('#confirm-action');assert((await removal).status()===204,'Eliminar colección falló.');await returnToList;
+  assert((await fetch(base+'/api/v1/public/resources/'+published.id)).ok,'Eliminar colección eliminó dataset.');
+  assert((await fetch(base+'/api/v1/public/collections/'+collection.id)).status===404,'Colección eliminada sigue pública.');
+  process.stdout.write('Colecciones OK: formularios, privado/público, membresía única, borradores ocultos y eliminación sin borrar datasets.\n');
+}
+async function verifyAnonymousApiSurface(base,document,draft) {
+  let checked=0;
+  for(const [route,item]of Object.entries(document.paths))for(const [method,op]of Object.entries(item)) {
+    if(!['get','post','put','patch','delete'].includes(method)||!route.startsWith('/api/v1/'))continue;
+    if(!op.security?.some(rule=>'bearer-jwt'in rule)||route.endsWith('/citation'))continue;
+    const url=route.replace(/\{[^}]+\}/g,encodeURIComponent(draft.id));
+    const options={method:method.toUpperCase(),redirect:'manual',signal:AbortSignal.timeout(10000)};
+    if(['post','put','patch'].includes(method)){options.headers={'Content-Type':method==='patch'?'application/json-patch+json':'application/json'};options.body=method==='patch'?'[]':'{}';}
+    const response=await fetch(base+url,options);
+    assert([401,403,404].includes(response.status),'Anonymous access boundary failed: '+method+' '+route+' '+response.status);
+    checked++;
+    if(method==='get'){const head=await fetch(base+url,{method:'HEAD',redirect:'manual',signal:AbortSignal.timeout(10000)});assert([401,403,404].includes(head.status),'HEAD bypass: '+route+' '+head.status);checked++;}
+  }
+  assert(checked>60,'API surface unexpectedly incomplete: '+checked);
+  process.stdout.write('Anonymous API inventory OK: '+checked+' private operations deny access before mutation.\n');
+}
+
+async function verifyMultiuserAccess(page, base, published, otherDraft) {
+  if (!verifiedAccount) return;
+  let userHeaders={Authorization:`Bearer ${verifiedAccount.token}`};
+  for(const [url,method]of [['/api/v1/dataresources/','GET'],['/api/v1/dataresources/search','POST'],['/api/v1/dataresources/search/data','POST']]){const options={method,headers:{...userHeaders,'Content-Type':'application/json'}};if(method==='POST')options.body='{}';assert((await fetch(base+url,options)).status===403,'Legacy collection bypasses publication guard: '+url);}
+  assert((await fetch(base+'/api/v1/search')).status===401,'Raw search exposed anonymously');
+  assert((await fetch(base+'/api/v1/search',{headers:userHeaders})).status===403,'Raw search exposed to normal user');
+  assert((await fetch(base+'/actuator/metrics')).status===401,'Actuator metrics exposed to anonymous');
+  assert((await fetch(base+'/actuator/metrics',{headers:userHeaders})).status===403,'Actuator metrics exposed to normal user');
+  const adminTasksToken=await page.evaluate(()=>localStorage.getItem('base-repo-token'));
+  assert((await fetch(base+'/actuator/metrics',{headers:{Authorization:'Bearer '+adminTasksToken}})).ok,'Administrator cannot inspect actuator metrics');
+  const taskResponse=await fetch(base+'/api/v1/my-deposit-tasks?page=0&size=1',{headers:{Authorization:`Bearer ${adminTasksToken}`}});
+  assert(taskResponse.ok,'No se pudieron consultar tareas del autor.');const tasks=await taskResponse.json();assert(tasks.total>1&&tasks.items.length===1&&tasks.pages===tasks.total,'Paginación de tareas inválida.');
+  assert(tasks.items.every(item=>['DRAFT','IN_REVIEW'].includes(item.status)&&item.resourceId!==published.id),'Tareas incluye publicado.');
+  const otherTasks=await fetch(base+'/api/v1/my-deposit-tasks',{headers:userHeaders});assert(otherTasks.ok&&(await otherTasks.json()).total===0,'Usuario ajeno recibió tareas privadas.');
+  assert((await fetch(base+'/api/v1/my-deposit-tasks')).status===401,'Tareas accesibles anónimamente.');
+  await page.goto(base+'/my-datasets.html',{waitUntil:'load'});await page.waitForFunction(()=>document.querySelector('#task-list article'));
+  assert(await page.$eval('#task-status',n=>n.textContent.includes('depósitos activos')),'Vista no informa tareas activas.');
+  process.stdout.write('Tareas OK: listado del autor, checklist, paginación y ausencia de datos ajenos.\n');
+  assert((await fetch(base+'/api/v1/scientific/preservation/storage',{headers:userHeaders})).status===403,'Usuario normal consultó volumen de servidor.');
+  assert((await fetch(base+'/api/v1/scientific/preservation/storage')).status===401,'Estado de volumen accesible anónimamente.');
+  const storageResponse=await fetch(base+'/api/v1/scientific/preservation/storage',{headers:{Authorization:`Bearer ${adminTasksToken}`}});
+  assert(storageResponse.ok&&storageResponse.headers.get('cache-control').includes('no-store'),'Estado operativo no protegido de caché.');
+  const volume=await storageResponse.json();assert(volume.status==='AVAILABLE'&&volume.totalBytes>0&&volume.usableBytes>=0&&!JSON.stringify(volume).includes('/tmp/'),'Medición de volumen inválida o ruta expuesta.');
+  await page.goto(base+'/operations.html',{waitUntil:'load'});await page.waitForSelector('#export-operations:not([disabled])');
+  assert(await page.$eval('#storage-summary',n=>n.textContent.includes('Disponible para la aplicación')),'Panel no informa capacidad.');
+  await page.evaluate(()=>{window.originalOperationsObjectURL=URL.createObjectURL;URL.createObjectURL=blob=>{blob.text().then(value=>window.exportedOperations=JSON.parse(value));return window.originalOperationsObjectURL(blob);};});
+  await page.click('#export-operations');await page.waitForFunction(()=>window.exportedOperations);
+  const operationalReport=await page.evaluate(()=>window.exportedOperations);assert(operationalReport.schema==='reduniv-operational-report/1'&&operationalReport.measuredAt&&operationalReport.storage.status==='AVAILABLE'&&Array.isArray(operationalReport.audits),'Informe exportado incompleto.');
+  await page.evaluate(()=>{URL.createObjectURL=window.originalOperationsObjectURL;});
+  process.stdout.write('Operaciones OK: volumen local, informe JSON y autorización/caché.\n');
+
+
+  assert((await fetch(base+'/api/v1/collections',{headers:userHeaders})).status===403,'Usuario normal puede gestionar colecciones.');
+  assert((await fetch(base+'/api/v1/collections',{method:'POST',headers:{...userHeaders,'Content-Type':'application/json'},body:JSON.stringify({title:'No autorizado',kind:'THEMATIC',published:true})})).status===403,'Usuario normal puede crear colecciones.');
+  assert((await fetch(base+'/api/v1/scientific/'+published.id+'/doi/landing-targets',{headers:userHeaders})).status===403,'Usuario accedió a mantenimiento DOI administrativo.');
+  assert((await fetch(base+'/api/v1/scientific/'+published.id+'/doi/refresh-urls',{method:'POST',headers:{...userHeaders,'Content-Type':'application/json'},body:'{}'})).status===403,'Usuario pudo actualizar URLs DOI.');
+  const catalogue=await fetch(base+'/api/v1/catalog?q='+encodeURIComponent(published.title), {headers:userHeaders});
+  assert(catalogue.ok && (await catalogue.json()).items.some(item=>item.id===published.id),
+    'El usuario verificado no ve el dataset compartido de otro autor.');
+  const adminPage=await fetch(base+'/api/v1/users',{headers:userHeaders});
+  assert(adminPage.status===403, `Gestión administrativa devolvió ${adminPage.status}: ${await adminPage.text()}`);
+  const edit=await fetch(`${base}/api/v1/scientific/${otherDraft}`,{
+    method:'PUT',headers:{...userHeaders,'Content-Type':'application/json'},body:JSON.stringify({versionLabel:'unauthorized-change'})
+  });
+  assert(edit.status===403, 'Un Usuario editó un depósito ajeno.');
+  const nextPassword=crypto.randomBytes(16).toString('hex');
+  const changed=await fetch(base+'/api/v1/auth/change-password',{
+    method:'POST',headers:{...userHeaders,'Content-Type':'application/json'},
+    body:JSON.stringify({currentPassword:verifiedAccount.password,newPassword:nextPassword})
+  });
+  assert(changed.ok,'El usuario no pudo cambiar su propia contraseña.');
+  assert((await fetch(base+'/api/v1/catalog',{headers:userHeaders})).status===401,
+    'El token antiguo sobrevivió al cambio de contraseña.');
+  const freshLogin=await fetch(base+'/api/v1/auth/login',{
+    method:'POST',headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({username:verifiedAccount.user.username,password:nextPassword})
+  });
+  assert(freshLogin.ok,'No se pudo iniciar sesión tras cambiar contraseña.');
+  const fresh=await freshLogin.json();
+  verifiedAccount.token=fresh.token; verifiedAccount.password=nextPassword;
+  userHeaders={Authorization:`Bearer ${fresh.token}`};
+  assert((await fetch(base+'/api/v1/catalog',{headers:userHeaders})).ok,
+    'La nueva sesión fue rechazada tras el cambio de contraseña.');
+  const adminToken=await page.evaluate(()=>localStorage.getItem('base-repo-token'));
+  const suspended=await fetch(`${base}/api/v1/users/${verifiedAccount.user.id}`, {
+    method:'PUT',headers:{Authorization:`Bearer ${adminToken}`,'Content-Type':'application/json'},
+    body:JSON.stringify({username:verifiedAccount.user.username,role:'USER',enabled:false})
+  });
+  assert(suspended.ok, 'No se pudo suspender la cuenta de prueba.');
+  const revoked=await fetch(base+'/api/v1/catalog',{headers:userHeaders});
+  assert(revoked.status===401, 'El token emitido antes de suspender conserva acceso.');
+  const loginResponse=await fetch(base+'/api/v1/auth/login',{
+    method:'POST',headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({username:verifiedAccount.user.username,password:verifiedAccount.password})
+  });
+  assert(loginResponse.status===403 && (await loginResponse.json()).code==='ACCOUNT_RESTRICTED',
+    'Login no informa cuenta restringida.');
+  process.stdout.write('Multiusuario OK: catálogo compartido, administración/edición denegadas y token bloqueado al suspender.\n');
+}
+async function verifyCatalogVolume(page,base) {
+  if(!postgres)return;
+  const token=await page.evaluate(()=>localStorage.getItem('base-repo-token'));
+  const marker='catalog-volume-'+crypto.randomBytes(8).toString('hex');
+  for(let start=0;start<221;start+=4)await Promise.all(Array.from({length:Math.min(4,221-start)},async(_,offset)=>{
+    const response=await fetch(base+'/api/v1/dataresources/',{method:'POST',headers:{Authorization:'Bearer '+token,'Content-Type':'application/json'},body:JSON.stringify({publisher:marker,publicationYear:'2025',resourceType:{value:'DATASET',typeGeneral:'DATASET'},creators:[{givenName:'Volume',familyName:'Fixture'}],titles:[{value:marker+' '+(start+offset)}]})});
+    assert(response.status===201,'Could not create volume fixture: '+response.status+' '+await response.text());
+  }));
+  const sql=`UPDATE scientific_records SET status='PUBLISHED', license_id='CC-BY-4.0', access_level='OPEN', discipline='Volume fixture', institution='Fixture University', language='es' WHERE resource_id IN (SELECT id FROM data_resource WHERE publisher='${marker}' ORDER BY id LIMIT 217)`;
+  const result=spawnSync(path.join(postgres.bin,'psql'),['-X','-v','ON_ERROR_STOP=1','-h','127.0.0.1','-p',String(postgres.port),'-U','e2e_admin','-d',postgres.database,'-c',sql],{env:{...process.env,PGPASSWORD:postgres.secret},encoding:'utf8'});
+  assert(result.status===0,'Could not publish synthetic local SQL fixture: '+result.stderr);
+  const ids=new Set();
+  for(let pageIndex=0;pageIndex<11;pageIndex++) {
+    const params=new URLSearchParams({q:marker,year:'2025',license:'CC-BY-4.0',access:'OPEN',author:'Volume Fixture',institution:'Fixture University',discipline:'Volume fixture',language:'es',sort:'year_asc',page:String(pageIndex),size:'20'});
+    const response=await fetch(base+'/api/v1/public/catalog?'+params);assert(response.ok,'Volume catalogue query failed');const body=await response.json();
+    assert(body.total===217&&body.pages===11&&body.page===pageIndex&&body.items.length===(pageIndex===10?17:20),'Volume pagination omitted entries beyond200.');
+    for(const item of body.items){assert(!ids.has(item.id),'Duplicate across pages');ids.add(item.id);}
+    const repeat=await(await fetch(base+'/api/v1/public/catalog?'+params)).json();assert(JSON.stringify(body.items)===JSON.stringify(repeat.items),'Unstable page ordering.');
+  }
+  assert(ids.size===217,'Volume fixture is incomplete.');
+  const facets=await(await fetch(base+'/api/v1/public/catalog/facets?q='+marker)).json();
+  assert(facets.author.some(e=>e.value.trim()==='Volume Fixture'&&e.count===217),'Facet counts duplicate or expose drafts.');
+  assert((await(await fetch(base+'/api/v1/public/catalog?q='+marker+'&license=CC0-1.0')).json()).total===0,'Combined filter ignored license.');
+  process.stdout.write('PostgreSQL catalogue volume OK:221 records,217 public,11 stable pages,combined filters,distinct facet counts and no drafts.\n');
+}
+
+async function restorePostgresFixture(page, base, files, published, profiledDraft) {
+  if (!postgres || process.env.E2E_POSTGRES_RESTORE !== '1') return;
+  await stopApp();
+  const args = ['-h','127.0.0.1','-p',String(postgres.port),'-U','e2e_admin'];
+  function pg(command, extra) {
+    const result = spawnSync(path.join(postgres.bin, command), [...args,...extra],
+      {encoding:'utf8',env:{...process.env,PGPASSWORD:postgres.secret}});
+    assert(result.status === 0, `Ensayo PostgreSQL ${command} falló: ${result.stderr}`);
+    return result;
+  }
+  function tree(directory, prefix='') {
+    const result = {};
+    for (const entry of fs.readdirSync(directory,{withFileTypes:true})) {
+      const relative = prefix + entry.name, target = path.join(directory,entry.name);
+      if (entry.isDirectory()) Object.assign(result,tree(target,relative+'/'));
+      else if (entry.isFile()) result[relative]=crypto.createHash('sha256').update(fs.readFileSync(target)).digest('hex');
+      else throw new Error('El fixture de restauración contiene enlace o archivo no regular.');
+    }
+    return result;
+  }
+  const baseline = tree(files.data);
+  const migration = path.join(root,'docs/migrations/2026-09-scientific-records.sql');
+  for (let i=0;i<2;i++) pg('psql',['-X','-v','ON_ERROR_STOP=1','-d',postgres.database,'-f',migration]);
+  function dataFingerprints(database) {
+    const tables = pg('psql',['-X','-At','-d',database,'-c',
+      "SELECT tablename FROM pg_tables WHERE schemaname='public' ORDER BY tablename"]).stdout.trim().split('\n').filter(Boolean);
+    const result = {};
+    for (const table of tables) {
+      const quoted = '"' + table.replaceAll('"','""') + '"';
+      const query = `SELECT count(*),md5(coalesce(string_agg(row_to_json(t)::text, E'\\n' ORDER BY row_to_json(t)::text),'')) FROM public.${quoted} t`;
+      result[table] = pg('psql',['-X','-At','-d',database,'-c',query]).stdout.trim();
+    }
+    return result;
+  }
+  const originalData = dataFingerprints(postgres.database);
+  const dump = path.join(temp,'fixture.dump');
+  pg('pg_dump',['-Fc','--no-owner','--no-acl','-d',postgres.database,'-f',dump]);
+  const backup=spawnSync('python3',[path.join(root,'tools/releases/package_backup.py'),'--dump',dump,'--files',files.data,'--config',path.join(temp,'application.properties'),'--output',path.join(temp,'private-backup.tar.gz'),'--writes-stopped','--pg-restore',path.join(postgres.bin,'pg_restore')],{encoding:'utf8'});assert(backup.status===0,'Private backup package failed: '+backup.stdout);
+  const verifiedBackup=spawnSync('python3',['-c',"import sys,tarfile,json,hashlib,os,stat; assert stat.S_IMODE(os.stat(sys.argv[1]).st_mode)==0o600; z=tarfile.open(sys.argv[1]); m=json.load(z.extractfile('manifest.json')); assert all(hashlib.sha256(z.extractfile(e['path']).read()).hexdigest()==e['sha256'] for e in m['files'])",path.join(temp,'private-backup.tar.gz')]);assert(verifiedBackup.status===0,'Backup hashes differ from packaged content');
+  pg('createdb',['reduniv_restored']);
+  pg('pg_restore',['--no-owner','--no-acl','--exit-on-error','-d','reduniv_restored',dump]);
+  assert(JSON.stringify(dataFingerprints('reduniv_restored')) === JSON.stringify(originalData),
+    'La restauración alteró filas o perdió tablas del fixture.');
+  const inventory = pg('psql',['-X','-d','reduniv_restored','-c',
+    'COPY (SELECT id, parent_resource_id, relative_path, content_uri FROM content_information ORDER BY id) TO STDOUT WITH CSV HEADER']).stdout;
+  const pathAudit = spawnSync('python3', [path.join(root,'tools/storage/audit_content_paths.py'),
+    '--basepath',files.data,'--strict'], {encoding:'utf8',input:inventory});
+  assert(pathAudit.status === 0, `Inventario de rutas restauradas detectó anomalías: ${pathAudit.stdout} ${pathAudit.stderr}`);
+  assert(!pathAudit.stdout.includes('Registros: 0.'), 'El inventario restaurado estaba vacío.');
+  process.stdout.write('Inventario de contentUri PostgreSQL restaurado OK (sin modificar datos).\n');
+  postgres.database='reduniv_restored'; postgres.restored=true;
+  await startApp(new URL(base).port,files);
+  const staleToken = await page.evaluate(() => localStorage.getItem('base-repo-token'));
+  assert(staleToken, 'Falta la sesión antigua para probar recuperación tras reinicio.');
+  await login(page,base);
+  assert(await page.evaluate(() => localStorage.getItem('base-repo-token')) !== staleToken,
+    'El nuevo login no sustituyó la sesión inválida después del reinicio.');
+  const restoredVocabulary=await page.evaluate(async()=>await (await fetch('/api/v1/scientific/vocabularies',{headers:auth.headers()})).json());
+  assert(restoredVocabulary.licenses.includes('Institutional-test'),'Restauración perdió vocabulario aprobado.');
+  const profileRecord=await page.evaluate(async id=>await (await fetch('/api/v1/scientific/'+id,{headers:auth.headers()})).json(),profiledDraft.id);assert(profileRecord.metadataProfileId==='test-profile'&&profileRecord.metadataProfileRequiredFields.includes('processingTools'),'Restauración perdió reglas congeladas de perfil.');
+  const response = await fetch(`${base}/api/v1/public/resources/${encodeURIComponent(published.id)}`);
+  assert(response.ok, 'El recurso publicado no sobrevivió a la restauración.');
+  const restored=await response.json();
+  assert(restored.processingDescription==='Limpieza científica declarada de valores ausentes.'&&restored.processingTools==='Python 3.12; script público v1.','Restauración perdió procedencia científica.');
+  assert(restored.title===published.title && restored.translations.en.title==='Translated scientific title' && restored.temporalStart==='2025-01-01','La restauración alteró título/traducciones/cobertura.');
+  const file = await fetch(`${base}/api/v1/public/resources/${encodeURIComponent(published.id)}/file?path=datos-uno.csv`);
+  assert(file.ok && (await file.text()).includes('nombre,valor'), 'Los archivos no son accesibles tras restaurar.');
+  assert(JSON.stringify(tree(files.data))===JSON.stringify(baseline), 'El ensayo alteró los archivos del depósito.');
+  process.stdout.write('Restauración PostgreSQL sintética OK: migración doble, datos idénticos, esquema validado y descarga.\n');
+}
+async function stopApp() {
+  if (app && app.exitCode === null && app.signalCode === null) {
+    app.kill('SIGTERM');
+    await Promise.race([new Promise(resolve => app.once('exit', resolve)), sleep(5000)]);
+    if (app.exitCode === null && app.signalCode === null) {
+      app.kill('SIGKILL');
+      await new Promise(resolve => app.once('exit', resolve));
+    }
+  }
+}
+async function cleanup() {
+  if (browser) await browser.close().catch(() => {});
+  await stopApp();
+  if (postgres) {
+    const stopped = spawnSync(path.join(postgres.bin, 'pg_ctl'), ['-D', postgres.data, '-m', 'immediate', '-w', 'stop'], {encoding:'utf8'});
+    assert(stopped.status === 0, 'No se pudo detener el PostgreSQL efímero; revise el directorio temporal.');
+  }
+  if (smtp) await new Promise(resolve => smtp.close(resolve));
+  fs.rmSync(temp, {recursive:true, force:true});
+}
+async function main() {
+  try {
+    const files = setupFiles();
+    const port = await freePort();
+    await startApp(port, files);
+    await verificationFlow(`http://127.0.0.1:${port}`);
+    browser = await puppeteer.launch({executablePath:chrome, headless:true,
+      args:['--no-sandbox', '--disable-dev-shm-usage']});
+    const page = await browser.newPage();
+    const pageErrors = [];
+    page.on('pageerror', error => pageErrors.push(error.stack || error.message));
+    const base = `http://127.0.0.1:${port}`;
+    const apiDocs=await fetch(base+'/v3/api-docs');assert(apiDocs.ok,'No se pudo generar OpenAPI local.');
+    const apiDocument=await apiDocs.json();const contract=validateOpenApi(apiDocument);
+    const baselinePath=path.join(root,'tools/contract/v1-baseline.json');if(fs.existsSync(baselinePath))process.stdout.write('API baseline compatibility: '+JSON.stringify(contractCompatibility.check(apiDocument,JSON.parse(fs.readFileSync(baselinePath,'utf8'))))+'\n');
+    if(process.env.E2E_CONTRACT_OUTPUT)fs.writeFileSync(process.env.E2E_CONTRACT_OUTPUT,JSON.stringify(contractCompatibility.snapshot(apiDocument),null,2)+'\n',{mode:0o600});process.stdout.write(`Contrato OpenAPI OK: ${contract.paths} rutas científicas y ${contract.localReferences} referencias locales.\n`);
+    await login(page, base);
+    const markdown = await deposit(page, base, files, 'md');
+    const zipped = await deposit(page, base, files, 'zip');
+    const packaged = await deposit(page, base, files, 'package');
+    await verifyAnonymousApiSurface(base,apiDocument,markdown);
+    await verifyTypeTransitionPolicy(page,base);
+    await verifyMutationCoordination(page,base,markdown,zipped);
+    await verifyPrimaryRowFence(page,base,markdown,zipped);
+    await verifyUploadLeaseLoss(page,base,markdown);
+    await verifyTwoJvmFence(page,base,markdown,zipped);
+    const before = await page.$eval('#download-list', element => element.textContent);
+    await rejectPackage(page, base, packaged.id, files.missingDescriptionZip, 'description/description.md');
+    await rejectPackage(page, base, packaged.id, files.invalidTypeZip, 'no admite archivos .exe');
+    await rejectPackage(page, base, packaged.id, files.fullTraversalZip, 'ruta no válida');
+    await rejectDescription(page, base, packaged.id, files.descriptionTraversalZip, 'ruta no permitida');
+    await rejectDescription(page, base, packaged.id, files.descriptionDuplicateZip, 'nombres repetidos');
+    await rejectDescription(page, base, packaged.id, files.descriptionHtmlZip, 'solo admite description.md e imágenes');
+    await page.reload({waitUntil:'load'});
+    await page.waitForFunction(() => document.querySelector('#download-list')?.textContent.includes('datos-uno.csv'));
+    assert(await page.$eval('#download-list', element => element.textContent) === before,
+      'Un ZIP rechazado alteró el contenido del depósito.');
+    await page.click('#submit-science');
+    await page.waitForFunction(() => document.querySelector('#submit-preview-content')?.textContent.includes('Paquete completo'));
+    assert(await page.$eval('#confirm-submit-science', element => !element.disabled),
+      'El envío quedó bloqueado pese a cumplir los requisitos de calidad.');
+    await page.click('#confirm-submit-science');
+    await page.waitForFunction(() => document.querySelector('#publication-status')?.textContent.includes('En revisión'));
+    const submitted = await page.evaluate(async () => {
+      const id = new URLSearchParams(location.search).get('id');
+      const response = await fetch(`/api/v1/scientific/${id}`, {headers:{Authorization:`Bearer ${localStorage.getItem('base-repo-token')}`}});
+      return (await response.json()).status;
+    });
+    assert(submitted === 'IN_REVIEW', `El depósito no llegó a revisión: ${submitted}`);
+    await page.goto(base + '/reviews.html', {waitUntil:'load'});
+    await page.waitForFunction(() => [...document.querySelectorAll('#reviews-list button')].some(button => button.textContent === 'Revisar metadatos y archivos'));
+    await page.evaluate(() => [...document.querySelectorAll('#reviews-list button')].find(button => button.textContent === 'Revisar metadatos y archivos').click());
+    await page.waitForFunction(() => document.querySelector('#reviews-list').textContent.includes('Requisitos automáticos completos.'));
+    await page.evaluate(() => [...document.querySelectorAll('.review-files button')].find(button => button.textContent === 'Descargar').click());
+    await page.waitForFunction(() => document.querySelector('.transfer-list')?.textContent.includes('Descarga preparada'));
+    const preservationResponse = observeResponse(page, response => response.url().includes('/preservation/') && response.url().endsWith('/package'));
+    await page.evaluate(() => [...document.querySelectorAll('#reviews-list button')].find(button => button.textContent === 'Descargar paquete de preservación').click());
+    const preservation = await preservationResponse;
+    assert(preservation.ok(), 'El paquete de preservación fue rechazado.');
+    const preservationZip = path.join(temp, 'preservation-download.zip');
+    fs.writeFileSync(preservationZip, await preservation.buffer());
+    const verifiedPackage = spawnSync('python3', ['-c', [
+      'import sys,zipfile,json,hashlib',
+      'z=zipfile.ZipFile(sys.argv[1]); assert z.testzip() is None',
+      "names=z.namelist(); assert 'data/datos-uno.csv' in names; assert any(n.endswith('description.md') for n in names)",
+      "assert 'BagIt-Version: 1.0' in z.read('bagit.txt').decode()",
+      "for name in ['preservation/metadata.json','preservation/provenance.json','preservation/prov.jsonld','ro-crate-metadata.json']: json.loads(z.read(name))",
+      "prov=json.loads(z.read('preservation/prov.jsonld')); declaration=next(n for n in prov['@graph'] if n['@id']=='#scientific-provenance'); assert 'Limpieza científica declarada' in declaration['schema:description'] and 'prov:wasGeneratedBy' not in declaration",
+      "crate=json.loads(z.read('ro-crate-metadata.json')); assert any(n.get('@id')=='#scientific-provenance' and 'Python 3.12' in n['description'] for n in crate['@graph'])",
+      "for name in ['manifest-sha256.txt','tagmanifest-sha256.txt']:",
+      " for line in z.read(name).decode().splitlines():",
+      "  if line.strip():",
+      "   digest,entry=line.split('  ',1); assert hashlib.sha256(z.read(entry)).hexdigest()==digest, entry"
+    ].join('\n'), preservationZip], {encoding:'utf8'});
+    assert(verifiedPackage.status === 0, `Paquete preservación inválido: ${verifiedPackage.stderr}`);
+    await page.waitForFunction(() => [...document.querySelectorAll('.transfer-item span')].filter(node => node.textContent === 'Descarga preparada').length === 2);
+    process.stdout.write('Curación OK: vista previa, archivo y paquete de preservación con manifiestos verificados.\n');
+    const reviewerLink = await page.evaluate(async id => {
+      const response = await fetch(`/api/v1/scientific/${encodeURIComponent(id)}/review-links`, {
+        method:'POST', headers:{Authorization:`Bearer ${localStorage.getItem('base-repo-token')}`, 'Content-Type':'application/json'},
+        body:JSON.stringify({hours:1})
+      });
+      if (!response.ok) throw new Error('No se pudo crear enlace local de revisión.');
+      return await response.json();
+    }, packaged.id);
+    const reviewerContext = await browser.createBrowserContext();
+    try {
+      const reviewer = await reviewerContext.newPage();
+      await reviewer.goto(new URL(reviewerLink.relativeUrl, base).href, {waitUntil:'load'});
+      await reviewer.waitForSelector('#review-files button');
+      assert(new URL(reviewer.url()).hash === '', 'El token permaneció en la URL del revisor.');
+      assert(await reviewer.evaluate(() => localStorage.getItem('base-repo-token')) === null, 'Revisor heredó autenticación.');
+      const privateResponse = observeResponse(reviewer, response => response.url().includes('/api/v1/reviewer/file?'));
+      await reviewer.click('#review-files button');
+      const privateFile = await privateResponse;
+      assert(privateFile.ok(), 'El archivo privado fue rechazado antes de revocar.');
+      assert((privateFile.headers()['cache-control'] || '').includes('no-store'), 'El archivo privado admite caché.');
+      await reviewer.waitForFunction(() => document.querySelector('.transfer-list')?.textContent.includes('Descarga preparada'));
+      const revoked = await page.evaluate(async ({id,linkId}) => {
+        const response = await fetch(`/api/v1/scientific/${encodeURIComponent(id)}/review-links/${linkId}`, {
+          method:'DELETE', headers:{Authorization:`Bearer ${localStorage.getItem('base-repo-token')}`}
+        });
+        return response.status;
+      }, {id:packaged.id,linkId:reviewerLink.id});
+      assert(revoked === 204, 'No se pudo revocar el enlace privado.');
+      const deniedResponse = observeResponse(reviewer, response => response.url().includes('/api/v1/reviewer/file?'));
+      await reviewer.click('#review-files button');
+      const denied = await deniedResponse;
+      assert(!denied.ok(), 'El enlace revocado todavía permite descargar.');
+      assert((denied.headers()['cache-control'] || '').includes('no-store'), 'La respuesta de enlace revocado admite caché.');
+      await reviewer.waitForFunction(() => document.querySelector('.transfer-item span')?.textContent === 'Error en la descarga');
+      assert(await reviewer.$eval('#review-status', node => node.textContent) === 'No se pudo descargar el archivo.',
+        'El rechazo del enlace no se informó al revisor.');
+      process.stdout.write('Revisor externo local OK: enlace temporal, no-store, descarga y revocación efectiva.\n');
+    } finally { await reviewerContext.close(); }
+    const recovered = await recoverInterruptedUpload(page, base, files);
+    const newVersionId = await deriveNewVersion(page, base, files, markdown);
+    await privacyFlow(page,base,zipped);
+    await publicVersionHistory(base,markdown,newVersionId,await page.evaluate(()=>localStorage.getItem('base-repo-token')));
+    await publicDownloads(base, markdown);
+    await usageAndAssessment(page,base,markdown);
+    await collectionsFlow(page, base, markdown, packaged);
+    await vocabularyFlow(page,base);
+    await metadataProfilesFlow(page,base,packaged);
+    await verifyMultiuserAccess(page,base,markdown,newVersionId);
+    await verifyCatalogVolume(page,base);
+    await restorePostgresFixture(page,base,files,markdown,packaged);
+    assert(pageErrors.length === 0, `Errores JavaScript: ${pageErrors.join('; ')}`);
+    process.stdout.write(`Asistente OK: ${markdown.title}; ${zipped.title}; ${packaged.title}; ${recovered}; nueva versión ${newVersionId}.\n`);
+  } catch (error) {
+    process.stderr.write(`${error.stack || error}\n`);
+    if(error.cause)process.stderr.write(`${error.cause.stack || error.cause}\n`);
+    const log = path.join(temp, 'application.log');
+    if (fs.existsSync(log)) {
+      fs.copyFileSync(log, '/tmp/reduniv-last-failed-application.log');fs.chmodSync('/tmp/reduniv-last-failed-application.log',0o600);
+      const relevant = fs.readFileSync(log, 'utf8').split('\n')
+        .filter(line => /ERROR|Exception|APPLICATION FAILED/.test(line)).slice(-12);
+      if (relevant.length) process.stderr.write(relevant.join('\n') + '\n');
+    }
+    process.exitCode = 1;
+  } finally { await cleanup(); }
+}
+main();

@@ -1,0 +1,183 @@
+package edu.kit.datamanager.repo.test.unit;
+
+import edu.kit.datamanager.repo.dao.IDataResourceDao;
+import edu.kit.datamanager.repo.domain.DataResource;
+import edu.kit.datamanager.repo.domain.PublicationStatus;
+import edu.kit.datamanager.repo.domain.ResourceOwnership;
+import edu.kit.datamanager.repo.domain.ScientificRecord;
+import edu.kit.datamanager.repo.repository.ResourceOwnershipRepository;
+import edu.kit.datamanager.repo.repository.ScientificRecordRepository;
+import edu.kit.datamanager.repo.repository.ScientificRecordEventRepository;
+import edu.kit.datamanager.repo.service.ScientificQualityService;
+import edu.kit.datamanager.repo.web.impl.ScientificRecordController;
+import java.util.Optional;
+import org.junit.After;
+import org.junit.Before;
+import org.junit.Test;
+import org.springframework.security.authentication.UsernamePasswordAuthenticationToken;
+import org.springframework.security.core.context.SecurityContextHolder;
+import org.springframework.web.server.ResponseStatusException;
+import org.springframework.test.util.ReflectionTestUtils;
+
+import static org.junit.Assert.*;
+import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.Mockito.*;
+
+public class ScientificRecordControllerTest {
+    private ScientificRecordRepository records;
+    private ResourceOwnershipRepository owners;
+    private IDataResourceDao resources;
+    private ScientificQualityService quality;
+    private ScientificRecordEventRepository events;
+    private ScientificRecordController controller;
+
+    @Before
+    public void setUp() {
+        records = mock(ScientificRecordRepository.class);
+        owners = mock(ResourceOwnershipRepository.class);
+        resources = mock(IDataResourceDao.class);
+        quality = mock(ScientificQualityService.class);
+        events = mock(ScientificRecordEventRepository.class);
+        when(resources.findById("r1")).thenReturn(Optional.of(mock(DataResource.class)));
+        when(owners.findById("r1")).thenReturn(Optional.of(new ResourceOwnership("r1", "author")));
+        when(records.save(any(ScientificRecord.class))).thenAnswer(call -> call.getArgument(0));
+        SecurityContextHolder.getContext().setAuthentication(new UsernamePasswordAuthenticationToken("author", null));
+        when(quality.inspect(any(ScientificRecord.class))).thenReturn(new ScientificQualityService.QualityReport(100, java.util.List.of(), java.util.List.of()));
+        controller = new ScientificRecordController(records, owners, resources, quality, events, org.mockito.Mockito.mock(edu.kit.datamanager.repo.service.ScientificResourceWriteLock.class));
+    }
+
+    @After
+    public void tearDown() { SecurityContextHolder.clearContext(); }
+
+    @Test
+    public void draftCanBeEditedAndSubmitted() {
+        ScientificRecord updated = controller.update("r1", new ScientificRecordController.UpdateRequest(
+                "1.0", "10.1234/version-one", null, "CC-BY-4.0", "OPEN", null, "es", "Física", "datos",
+                "0000-0002-1825-0097", "Universidad", null, null, "Métodos reproducibles"));
+        assertEquals(PublicationStatus.DRAFT, updated.getStatus());
+        when(records.findById("r1")).thenReturn(Optional.of(updated));
+        ScientificRecord submitted = controller.submit("r1");
+        assertEquals(PublicationStatus.IN_REVIEW, submitted.getStatus());
+        assertNotNull(submitted.getSubmittedAt());
+        verify(events, atLeastOnce()).save(any());
+    }
+
+    @Test
+    public void publishingRequiresRegisteredDoiAttestation() {
+        ScientificRecord record = new ScientificRecord("r1");
+        record.setStatus(PublicationStatus.IN_REVIEW);
+        record.setVersionLabel("1.0"); record.setVersionDoi("10.1234/version-one"); record.setLicenseId("CC-BY-4.0");
+        when(records.findById("r1")).thenReturn(Optional.of(record));
+        assertThrows(ResponseStatusException.class, () -> controller.publish("r1", new ScientificRecordController.PublicationApproval(false)));
+        ScientificRecord published = controller.publish("r1", new ScientificRecordController.PublicationApproval(true));
+        assertEquals(PublicationStatus.PUBLISHED, published.getStatus());
+        assertNotNull(published.getPublishedAt());
+        assertThrows(ResponseStatusException.class, () -> controller.update("r1", new ScientificRecordController.UpdateRequest(
+                null, null, null, null, null, null, null, null, null, null, null, null, null, null)));
+    }
+
+    @Test
+    public void automatedDoiModeRejectsManualPublicationAndDoiOverride() {
+        ReflectionTestUtils.setField(controller, "automatedDoiEnabled", true);
+        ScientificRecord record = new ScientificRecord("r1");
+        when(records.findById("r1")).thenReturn(Optional.of(record));
+        assertThrows(ResponseStatusException.class, () -> controller.update("r1", new ScientificRecordController.UpdateRequest(
+                "1.0", "10.1234/manual", null, "CC-BY-4.0", "OPEN", null, "es", "Física", "datos", null,
+                "Universidad", null, null, "Métodos")));
+        record.setStatus(PublicationStatus.IN_REVIEW);
+        assertThrows(ResponseStatusException.class, () -> controller.publish("r1", new ScientificRecordController.PublicationApproval(true)));
+    }
+
+    @Test
+    public void newVersionReferencesOnlyPublishedOwnResource() {
+        when(resources.findById("r2")).thenReturn(Optional.of(mock(DataResource.class)));
+        when(owners.findById("r2")).thenReturn(Optional.of(new ResourceOwnership("r2", "author")));
+        ScientificRecord previous = new ScientificRecord("r1"); previous.setStatus(PublicationStatus.PUBLISHED);
+        previous.setConceptualDoi("10.1234/concept");
+        previous.setMetadataProfileId("tabular");previous.setMetadataProfileName("Perfil publicado");previous.setMetadataProfileRevision(3L);previous.setMetadataProfileRequiredFields(new java.util.LinkedHashSet<>(java.util.Set.of("processingTools")));
+        when(records.findById("r1")).thenReturn(Optional.of(previous));
+        ScientificRecord derived = controller.deriveFrom("r2", "r1");
+        assertEquals("r1", derived.getPreviousResourceId());
+        assertEquals("10.1234/concept", derived.getConceptualDoi());
+        assertEquals(PublicationStatus.DRAFT, derived.getStatus());
+        assertEquals("tabular",derived.getMetadataProfileId());assertEquals(Long.valueOf(3),derived.getMetadataProfileRevision());assertEquals(java.util.Set.of("processingTools"),derived.getMetadataProfileRequiredFields());assertNotSame(previous.getMetadataProfileRequiredFields(),derived.getMetadataProfileRequiredFields());previous.getMetadataProfileRequiredFields().clear();assertEquals(java.util.Set.of("processingTools"),derived.getMetadataProfileRequiredFields());
+    }
+
+    @Test
+    public void onlyAuthorOrCuratorCanReadInternalHistory() {
+        assertNotNull(controller.history("r1"));
+        SecurityContextHolder.getContext().setAuthentication(new UsernamePasswordAuthenticationToken("other", null));
+        assertThrows(ResponseStatusException.class, () -> controller.history("r1"));
+    }
+    private ScientificRecordController.UpdateRequest extended(String summary,String start,String end,String geography,
+            java.util.Map<String,edu.kit.datamanager.repo.domain.LocalizedScientificMetadata> translations) {
+        return new ScientificRecordController.UpdateRequest("1.0",null,null,"CC-BY-4.0","OPEN",null,"es",null,null,
+            null,"Universidad",null,null,"Método",summary,start,end,geography,translations);
+    }
+    @Test public void structuredMetadataAndTranslationsAreValidatedAndCanonicalized() {
+        var input=extended(" Resumen ","2025-01-01","2025-12-31"," Cuba ",java.util.Map.of("en-us",
+            new edu.kit.datamanager.repo.domain.LocalizedScientificMetadata(" Translated title "," Summary ")));
+        var saved=controller.update("r1",input);
+        assertEquals("Resumen",saved.getSummary());assertEquals("Cuba",saved.getGeographicCoverage());
+        assertEquals(java.time.LocalDate.of(2025,1,1),saved.getTemporalStart());
+        assertEquals("Translated title",saved.getTranslations().get("en-US").getTitle());
+    }
+    @Test public void invalidCoverageAndDuplicateOrEmptyTranslationsAreRejected() {
+        assertThrows(ResponseStatusException.class,()->controller.update("r1",extended("x","2025-12-31","2025-01-01",null,null)));
+        assertThrows(ResponseStatusException.class,()->controller.update("r1",extended("x","not-date",null,null,null)));
+        assertThrows(ResponseStatusException.class,()->controller.update("r1",extended("x",null,null,null,java.util.Map.of("invalid_language",new edu.kit.datamanager.repo.domain.LocalizedScientificMetadata("x",null)))));
+        assertThrows(ResponseStatusException.class,()->controller.update("r1",extended("x",null,null,null,java.util.Map.of("en",new edu.kit.datamanager.repo.domain.LocalizedScientificMetadata(null,null)))));
+        assertThrows(ResponseStatusException.class,()->controller.update("r1",extended("x",null,null,null,java.util.Map.of("en-US",new edu.kit.datamanager.repo.domain.LocalizedScientificMetadata("x",null),"en-us",new edu.kit.datamanager.repo.domain.LocalizedScientificMetadata("y",null)))));
+    }
+    @Test public void omittedNewFieldsPreserveStoredValuesAndExplicitBlankClears() {
+        var record=controller.update("r1",extended("Resumen","2025-01-01",null,"Cuba",java.util.Map.of("en",new edu.kit.datamanager.repo.domain.LocalizedScientificMetadata("Title",null))));
+        when(records.findById("r1")).thenReturn(Optional.of(record));
+        controller.update("r1",extended(null,null,null,null,null));
+        assertEquals("Resumen",record.getSummary());assertEquals(1,record.getTranslations().size());
+        controller.update("r1",extended("","","","",java.util.Map.of()));
+        assertNull(record.getSummary());assertNull(record.getTemporalStart());assertTrue(record.getTranslations().isEmpty());
+    }
+    @Test public void structuredFieldsCannotBeChangedAfterPublicationOrByOtherAuthor() {
+        var record=new ScientificRecord("r1");record.setStatus(PublicationStatus.PUBLISHED);
+        when(records.findById("r1")).thenReturn(Optional.of(record));
+        assertThrows(ResponseStatusException.class,()->controller.update("r1",extended("changed",null,null,null,null)));
+        record.setStatus(PublicationStatus.DRAFT);SecurityContextHolder.getContext().setAuthentication(new UsernamePasswordAuthenticationToken("other",null));
+        assertThrows(ResponseStatusException.class,()->controller.update("r1",extended("changed",null,null,null,null)));
+        verify(records,never()).save(any());
+    }
+    @Test public void privacyGuardsSubmissionPublicationAndRevokesOnReturn() {
+        var privacy=mock(edu.kit.datamanager.repo.service.ScientificPrivacyService.class);
+        ReflectionTestUtils.setField(controller,"privacy",privacy);
+        var record=new ScientificRecord("r1");record.setStatus(PublicationStatus.IN_REVIEW);
+        when(records.findById("r1")).thenReturn(Optional.of(record));
+        doThrow(new ResponseStatusException(org.springframework.http.HttpStatus.CONFLICT,"Privacy approval missing"))
+            .when(privacy).requirePublicationAllowed("r1","OPEN");
+        assertThrows(ResponseStatusException.class,()->controller.publish("r1",new ScientificRecordController.PublicationApproval(true)));
+        controller.returnToDraft("r1");verify(privacy).clearReview("r1");
+        doThrow(new ResponseStatusException(org.springframework.http.HttpStatus.BAD_REQUEST,"Assessment missing"))
+            .when(privacy).requireSubmissionAllowed("r1","OPEN");
+        assertThrows(ResponseStatusException.class,()->controller.submit("r1"));
+        assertEquals(PublicationStatus.DRAFT,record.getStatus());
+    }
+
+    private ScientificRecordController.UpdateRequest provenance(String production,String processing,String tools){
+        return new ScientificRecordController.UpdateRequest("1.0",null,null,"CC-BY-4.0","OPEN",null,"es",null,null,null,"Universidad",null,null,"Método",null,null,null,null,null,production,processing,tools);
+    }
+    @Test public void scientificProvenancePreservesOmittedAndClearsBlank(){
+        var record=controller.update("r1",provenance(" Recogida "," Limpieza "," Python 3.12 "));
+        assertEquals("Recogida",record.getProductionDescription());assertEquals("Limpieza",record.getProcessingDescription());assertEquals("Python 3.12",record.getProcessingTools());
+        when(records.findById("r1")).thenReturn(Optional.of(record));controller.update("r1",provenance(null,null,null));assertEquals("Recogida",record.getProductionDescription());
+        controller.update("r1",provenance("","",""));assertNull(record.getProductionDescription());assertNull(record.getProcessingDescription());assertNull(record.getProcessingTools());
+    }
+    @Test public void scientificProvenanceLimitsAndPublishedGuard(){
+        assertThrows(ResponseStatusException.class,()->controller.update("r1",provenance("x".repeat(5001),null,null)));
+        assertThrows(ResponseStatusException.class,()->controller.update("r1",provenance(null,"x".repeat(5001),null)));
+        assertThrows(ResponseStatusException.class,()->controller.update("r1",provenance(null,null,"x".repeat(2001))));
+        var record=new ScientificRecord("r1");record.setStatus(PublicationStatus.PUBLISHED);when(records.findById("r1")).thenReturn(Optional.of(record));
+        assertThrows(ResponseStatusException.class,()->controller.update("r1",provenance("changed",null,null)));
+    }
+    @Test public void manualPublicationChecksFrozenProfileRules(){
+        var record=new ScientificRecord("r1");record.setStatus(PublicationStatus.IN_REVIEW);record.setVersionLabel("1.0");record.setVersionDoi("10.1234/profiled");record.setLicenseId("CC-BY-4.0");record.setMetadataProfileRequiredFields(new java.util.LinkedHashSet<>(java.util.Set.of("processingTools")));when(records.findById("r1")).thenReturn(Optional.of(record));
+        var error=assertThrows(ResponseStatusException.class,()->controller.publish("r1",new ScientificRecordController.PublicationApproval(true)));assertEquals(400,error.getStatusCode().value());assertEquals(PublicationStatus.IN_REVIEW,record.getStatus());record.setProcessingTools("Python 3.12");assertEquals(PublicationStatus.PUBLISHED,controller.publish("r1",new ScientificRecordController.PublicationApproval(true)).getStatus());
+    }
+}
