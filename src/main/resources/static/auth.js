@@ -52,7 +52,7 @@ if (signedInUser && auth.token() && ['collections.html','self-assessment.html'].
 }
 document.querySelectorAll('.brand').forEach(brand => {
   const logo = document.createElement('img'); logo.src = 'logo%20mes.png'; uiI18n.attribute(logo,'alt','brand.alt');
-  const name = document.createElement('span'); name.textContent = 'Datos RedUniv'; brand.replaceChildren(logo,name);
+  const name = document.createElement('span'); name.textContent = 'EXPLORA'; brand.replaceChildren(logo,name);
 });
 const editorial = ['CURATOR','ADMINISTRATOR'].includes(signedInUser?.role);
 const administrator = signedInUser?.role === 'ADMINISTRATOR';
