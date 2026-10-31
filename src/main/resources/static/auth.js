@@ -60,28 +60,57 @@ const editorial = ['CURATOR','ADMINISTRATOR'].includes(signedInUser?.role);
 const administrator = signedInUser?.role === 'ADMINISTRATOR';
 const navigation = [
   ['index.html','nav.catalog',true], ['my-datasets.html','nav.mine',true],
-  ['reviews.html','nav.reviews',editorial], ['users.html','nav.users',administrator],
   [editorial?'collections.html?manage=true':'collections.html','nav.collections',true],
-  ['operations.html','nav.operations',editorial], ['self-assessment.html','nav.assessment',editorial],
-  ['vocabulary-admin.html','nav.vocabularies',administrator], ['metadata-profiles-admin.html','nav.profiles',administrator]
+  ['reviews.html','nav.reviews',editorial]
+];
+const managementNavigation = [
+  ['users.html','nav.users',administrator], ['operations.html','nav.operations',editorial],
+  ['self-assessment.html','nav.assessment',editorial], ['vocabulary-admin.html','nav.vocabularies',administrator],
+  ['metadata-profiles-admin.html','nav.profiles',administrator]
 ];
 const activeSection = ['resource.html','create.html'].includes(currentSection) ? 'my-datasets.html' : currentSection;
 document.querySelectorAll('.sidebar').forEach(sidebar => {
   const nav = sidebar.querySelector('nav'); nav.replaceChildren(); uiI18n.attribute(nav,'aria-label','nav.main');
   for (const [href,key,visible] of navigation) {
-    // Keep this hidden anchor for older page scripts; authorization remains server-side.
-    if (!visible && href !== 'users.html') continue;
+    if (!visible) continue;
     const link = document.createElement('a'); link.href = href; link.hidden = !visible;
-    if (href === 'users.html') link.id = 'users-nav';
     if (href.split('?')[0] === activeSection) {link.className = 'active'; link.setAttribute('aria-current','page');}
     uiI18n.set(link,key); nav.append(link);
   }
+  const managementItems = managementNavigation.filter(([, , visible]) => visible);
+  if (managementItems.length) {
+    const group = document.createElement('div'); group.className = 'nav-disclosure';
+    const button = document.createElement('button'); button.type = 'button'; button.className = 'nav-disclosure-button';
+    button.setAttribute('aria-expanded','false'); button.setAttribute('aria-controls','management-navigation');
+    button.textContent = document.documentElement.lang === 'en' ? 'Management' : 'Gestión';
+    const panel = document.createElement('div'); panel.className = 'nav-disclosure-panel'; panel.id = 'management-navigation'; panel.hidden = true;
+    for (const [href,key] of managementItems) {
+      const link = document.createElement('a'); link.href = href;
+      if (href === 'users.html') link.id = 'users-nav';
+      if (href === activeSection) { link.className = 'active'; link.setAttribute('aria-current','page'); group.classList.add('has-active'); }
+      uiI18n.set(link,key); panel.append(link);
+    }
+    const close = focus => { panel.hidden = true; button.setAttribute('aria-expanded','false'); if (focus) button.focus(); };
+    button.addEventListener('click',()=>{const open=panel.hidden;panel.hidden=!open;button.setAttribute('aria-expanded',String(open));});
+    group.addEventListener('keydown',event=>{if(event.key==='Escape')close(true);});
+    group.addEventListener('focusout',()=>setTimeout(()=>{if(!group.contains(document.activeElement))close(false);},0));
+    group.append(button,panel); nav.append(group);
+  }
   const select = document.querySelector('[data-ui-locale]');
   if (select) {
-    let label = select.closest('label.locale-picker');
-    if (!label) {label = document.createElement('label'); const caption = document.createElement('span'); uiI18n.set(caption,'language'); label.append(caption,select);}
-    label.classList.add('locale-picker','sidebar-locale'); uiI18n.attribute(select,'aria-label','language');
-    sidebar.insertBefore(label,nav);
+    const oldLabel = select.closest('label.locale-picker');
+    const control = document.createElement('div'); control.className = 'language-control';
+    const button = document.createElement('button'); button.type='button'; button.className='language-button';
+    button.setAttribute('aria-expanded','false'); button.setAttribute('aria-controls','language-options');
+    const globe = '<svg aria-hidden="true" viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M3 12h18M12 3c3 3 4 6 4 9s-1 6-4 9c-3-3-4-6-4-9s1-6 4-9Z"/></svg>';
+    const update = () => {button.innerHTML=`${globe}<span>${select.value.toUpperCase()}</span>`;button.setAttribute('aria-label',select.value==='en'?'Change language. Current: English':'Cambiar idioma. Actual: Español');};
+    const options=document.createElement('div');options.className='language-options';options.id='language-options';options.hidden=true;
+    [...select.options].forEach(option=>{const choice=document.createElement('button');choice.type='button';choice.lang=option.value;choice.textContent=option.textContent;choice.addEventListener('click',()=>{select.value=option.value;select.dispatchEvent(new Event('change',{bubbles:true}));options.hidden=true;button.setAttribute('aria-expanded','false');update();button.focus();});options.append(choice);});
+    button.addEventListener('click',()=>{const open=options.hidden;options.hidden=!open;button.setAttribute('aria-expanded',String(open));});
+    control.addEventListener('keydown',event=>{if(event.key==='Escape'){options.hidden=true;button.setAttribute('aria-expanded','false');button.focus();}});
+    control.addEventListener('focusout',()=>setTimeout(()=>{if(!control.contains(document.activeElement)){options.hidden=true;button.setAttribute('aria-expanded','false');}},0));
+    select.classList.add('visually-hidden'); control.append(select,button,options); update();
+    oldLabel?.remove(); sidebar.insertBefore(control,sidebar.querySelector('.sidebar-bottom'));
   }
 });
 document.querySelectorAll('#current-user').forEach(node=>{
